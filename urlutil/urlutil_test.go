@@ -41,6 +41,11 @@ func TestNormalizeURL(t *testing.T) {
 			input:    "https://example.com/blog/#top",
 			expected: "https://example.com/blog",
 		},
+		{
+			name:     "empty path becomes root slash",
+			input:    "http://example.com",
+			expected: "http://example.com/",
+		},
 	}
 
 	for _, tt := range tests {

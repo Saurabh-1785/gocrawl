@@ -24,7 +24,13 @@ func NormalizeURL(rawURL string) (string, error) {
 	// Fragments are just for in-page navigation, same page either way
 	parsedURL.Fragment = ""
 
-	// Step 5: Build the cleaned URL string
+	// Step 5: Normalize empty path to "/" so that
+	// "http://example.com" and "http://example.com/" are treated as the same URL
+	if parsedURL.Path == "" {
+		parsedURL.Path = "/"
+	}
+
+	// Step 6: Build the cleaned URL string
 	result := parsedURL.String()
 
 	// Step 6: Remove trailing slash, but keep it for root paths like "http://example.com/"

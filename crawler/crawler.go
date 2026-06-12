@@ -6,8 +6,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Saurabh/gocrawl/config"
-	"github.com/Saurabh/gocrawl/urlutil"
+	"github.com/Saurabh-1785/gocrawl/config"
+	"github.com/Saurabh-1785/gocrawl/urlutil"
 )
 
 // Crawler is the main engine that coordinates everything.

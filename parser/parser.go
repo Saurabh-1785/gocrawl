@@ -3,7 +3,7 @@ package parser
 import (
 	"strings"
 
-	"github.com/Saurabh/gocrawl/urlutil"
+	"github.com/Saurabh-1785/gocrawl/urlutil"
 	"golang.org/x/net/html"
 )
 

@@ -7,8 +7,8 @@ import (
 	"os"
 	"time"
 
-	"github.com/Saurabh/gocrawl/config"
-	"github.com/Saurabh/gocrawl/crawler"
+	"github.com/Saurabh-1785/gocrawl/config"
+	"github.com/Saurabh-1785/gocrawl/crawler"
 )
 
 func main() {
@@ -56,8 +56,8 @@ func main() {
 func printBanner() {
 	fmt.Println()
 	fmt.Println("  ╔═══════════════════════════════════╗")
-	fmt.Println("  ║         🕷️  GoCrawl v1.0          ║")
-	fmt.Println("  ║   Concurrent Web Crawler in Go    ║")
+	fmt.Println("  ║             GoCrawl v1.0          ║")
+	fmt.Println("  ║        Concurrent Web Crawler     ║")
 	fmt.Println("  ╚═══════════════════════════════════╝")
 	fmt.Println()
 }

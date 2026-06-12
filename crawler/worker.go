@@ -4,9 +4,9 @@ import (
 	"log"
 	"sync"
 
-	"github.com/Saurabh/gocrawl/fetcher"
-	"github.com/Saurabh/gocrawl/parser"
-	"github.com/Saurabh/gocrawl/urlutil"
+	"github.com/Saurabh-1785/gocrawl/fetcher"
+	"github.com/Saurabh-1785/gocrawl/parser"
+	"github.com/Saurabh-1785/gocrawl/urlutil"
 )
 
 // worker is a goroutine that processes crawl tasks from the channel.

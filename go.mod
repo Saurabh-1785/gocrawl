@@ -1,5 +1,7 @@
-module github.com/Saurabh/gocrawl
+module github.com/Saurabh-1785/gocrawl
 
-go 1.21
+go 1.23.0
+
+toolchain go1.24.4
 
 require golang.org/x/net v0.40.0

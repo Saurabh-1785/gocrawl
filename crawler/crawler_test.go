@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Saurabh/gocrawl/config"
+	"github.com/Saurabh-1785/gocrawl/config"
 )
 
 // ===================================================================
