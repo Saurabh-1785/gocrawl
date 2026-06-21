@@ -17,6 +17,11 @@ type Crawler struct {
 	visited     *VisitedStore
 	rateLimiter *RateLimiter
 	stats       *CrawlStats
+
+	// OnPageFetched is an optional callback invoked after a page is successfully
+	// fetched and its links are extracted. It receives the page URL, raw HTML body,
+	// and HTTP status code. Use this to plug in content extraction and storage.
+	OnPageFetched func(pageURL string, body string, statusCode int)
 }
 
 // NewCrawler creates a new Crawler with the given configuration.

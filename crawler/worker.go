@@ -80,6 +80,11 @@ func (c *Crawler) processTask(workerID int, task CrawlTask, tasks chan CrawlTask
 	links := parser.ExtractLinks(body, task.URL)
 	log.Printf("[DEBUG] [Worker %d] Found %d links on %s", workerID, len(links), task.URL)
 
+	// Call the callback if one is registered (used for content extraction + storage)
+	if c.OnPageFetched != nil {
+		c.OnPageFetched(task.URL, body, statusCode)
+	}
+
 	// Process each discovered link
 	for _, link := range links {
 		// Only follow links on the same domain

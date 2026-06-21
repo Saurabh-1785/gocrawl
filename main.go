@@ -9,6 +9,8 @@ import (
 
 	"github.com/Saurabh-1785/gocrawl/config"
 	"github.com/Saurabh-1785/gocrawl/crawler"
+	"github.com/Saurabh-1785/gocrawl/docstore"
+	"github.com/Saurabh-1785/gocrawl/extractor"
 )
 
 func main() {
@@ -20,6 +22,7 @@ func main() {
 	workers := flag.Int("workers", 3, "Number of concurrent workers")
 	timeout := flag.Duration("timeout", 10*time.Second, "HTTP request timeout (e.g., 10s, 30s)")
 	crawlDelay := flag.Duration("delay", 1*time.Second, "Delay between requests to the same domain (e.g., 1s, 500ms)")
+	outputFile := flag.String("output", "output.jsonl", "Output JSONL file path for extracted documents (appends to existing file)")
 
 	// Parse the flags from the command line
 	flag.Parse()
@@ -45,19 +48,37 @@ func main() {
 	// Print a nice startup banner
 	printBanner()
 
-	// Create the crawler and start crawling!
+	// Set up the document store (JSONL output)
+	store, err := docstore.NewDocStore(*outputFile)
+	if err != nil {
+		log.Fatalf("[ERROR] Failed to create document store: %v", err)
+	}
+	defer store.Close()
+
+	log.Printf("[INFO]  Output file: %s (append mode)", *outputFile)
+
+	// Create the crawler and wire up the extraction pipeline
 	c := crawler.NewCrawler(cfg)
+
+	// Wire: Crawler → Extractor → Document Store
+	c.OnPageFetched = func(pageURL string, body string, statusCode int) {
+		doc := extractor.Extract(pageURL, body, statusCode)
+		if err := store.Save(doc); err != nil {
+			log.Printf("[ERROR] Failed to save document for %s: %v", pageURL, err)
+		}
+	}
+
 	c.Run()
 
-	log.Println("[INFO]  Crawl completed successfully!")
+	log.Printf("[INFO]  Crawl completed! %d documents saved to %s", store.Count(), *outputFile)
 }
 
 // printBanner displays a startup message
 func printBanner() {
 	fmt.Println()
 	fmt.Println("  ╔═══════════════════════════════════╗")
-	fmt.Println("  ║             GoCrawl v1.0          ║")
-	fmt.Println("  ║        Concurrent Web Crawler     ║")
+	fmt.Println("  ║           GoCrawl v2.0            ║")
+	fmt.Println("  ║     Crawl · Extract · Store       ║")
 	fmt.Println("  ╚═══════════════════════════════════╝")
 	fmt.Println()
 }

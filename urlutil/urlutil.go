@@ -7,6 +7,8 @@ import (
 
 // NormalizeURL cleans up a URL so we can compare URLs consistently.
 // For example, "HTTP://Example.COM/page#section" becomes "http://example.com/page"
+// It also strips common index files (index.html, index.htm, index.php)
+// so that "/" and "/index.html" are treated as the same URL.
 func NormalizeURL(rawURL string) (string, error) {
 	// Step 1: Parse the URL into its components
 	parsedURL, err := url.Parse(rawURL)
@@ -30,10 +32,28 @@ func NormalizeURL(rawURL string) (string, error) {
 		parsedURL.Path = "/"
 	}
 
-	// Step 6: Build the cleaned URL string
+	// Step 6: Strip common index files — these all represent the same page
+	// as their parent directory. e.g., /index.html → /, /blog/index.html → /blog/
+	indexFiles := []string{
+		"/index.html", "/index.htm", "/index.php",
+		"/default.html", "/default.htm",
+	}
+	pathLower := strings.ToLower(parsedURL.Path)
+	for _, idx := range indexFiles {
+		if pathLower == idx {
+			parsedURL.Path = "/"
+			break
+		}
+		if strings.HasSuffix(pathLower, idx) {
+			parsedURL.Path = parsedURL.Path[:len(parsedURL.Path)-len(idx)+1]
+			break
+		}
+	}
+
+	// Step 7: Build the cleaned URL string
 	result := parsedURL.String()
 
-	// Step 6: Remove trailing slash, but keep it for root paths like "http://example.com/"
+	// Step 8: Remove trailing slash, but keep it for root paths like "http://example.com/"
 	if strings.HasSuffix(result, "/") && parsedURL.Path != "/" && parsedURL.Path != "" {
 		result = strings.TrimSuffix(result, "/")
 	}
@@ -76,8 +96,8 @@ func IsSameDomain(seedURL string, checkURL string) bool {
 		return false
 	}
 
-	// Compare the hostnames (lowercased for consistency)
-	return strings.ToLower(seedParsed.Host) == strings.ToLower(checkParsed.Host)
+	// Compare the hostnames (case-insensitive)
+	return strings.EqualFold(seedParsed.Host, checkParsed.Host)
 }
 
 // IsValidURL checks if a URL uses the http or https scheme.

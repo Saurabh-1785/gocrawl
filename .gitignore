@@ -1,0 +1,15 @@
+# Generated corpora
+*.jsonl
+
+# Large datasets
+data/
+corpus/
+
+# Binaries
+gocrawl
+gosearch
+
+# Go
+*.test
+coverage.out
+*gocrawl

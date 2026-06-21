@@ -46,6 +46,31 @@ func TestNormalizeURL(t *testing.T) {
 			input:    "http://example.com",
 			expected: "http://example.com/",
 		},
+		{
+			name:     "strip index.html to root",
+			input:    "http://example.com/index.html",
+			expected: "http://example.com/",
+		},
+		{
+			name:     "strip index.htm to root",
+			input:    "http://example.com/index.htm",
+			expected: "http://example.com/",
+		},
+		{
+			name:     "strip index.php to root",
+			input:    "http://example.com/index.php",
+			expected: "http://example.com/",
+		},
+		{
+			name:     "strip subdirectory index.html",
+			input:    "http://example.com/blog/index.html",
+			expected: "http://example.com/blog",
+		},
+		{
+			name:     "dont strip non-index file",
+			input:    "http://example.com/about.html",
+			expected: "http://example.com/about.html",
+		},
 	}
 
 	for _, tt := range tests {
