@@ -7,15 +7,11 @@ import (
 	"os"
 	"time"
 
-	"github.com/Saurabh-1785/gocrawl/config"
-	"github.com/Saurabh-1785/gocrawl/crawler"
-	"github.com/Saurabh-1785/gocrawl/docstore"
-	"github.com/Saurabh-1785/gocrawl/extractor"
+	"github.com/Saurabh-1785/gocrawl/crawl"
 )
 
 func main() {
 	// Define command-line flags
-	// These let the user control how the crawler behaves
 	seedURL := flag.String("url", "", "Seed URL to start crawling (required)")
 	maxDepth := flag.Int("depth", 2, "Maximum crawl depth (0 = seed page only)")
 	maxPages := flag.Int("pages", 50, "Maximum number of pages to crawl")
@@ -24,22 +20,10 @@ func main() {
 	crawlDelay := flag.Duration("delay", 1*time.Second, "Delay between requests to the same domain (e.g., 1s, 500ms)")
 	outputFile := flag.String("output", "output.jsonl", "Output JSONL file path for extracted documents (appends to existing file)")
 
-	// Parse the flags from the command line
 	flag.Parse()
 
-	// Build the configuration struct
-	cfg := config.Config{
-		SeedURL:    *seedURL,
-		MaxDepth:   *maxDepth,
-		MaxPages:   *maxPages,
-		Workers:    *workers,
-		Timeout:    *timeout,
-		CrawlDelay: *crawlDelay,
-	}
-
-	// Validate the configuration
-	if err := config.ValidateConfig(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
+	if *seedURL == "" {
+		fmt.Fprintf(os.Stderr, "Error: seed URL is required (use -url flag)\n\n")
 		fmt.Println("Usage:")
 		flag.PrintDefaults()
 		os.Exit(1)
@@ -48,29 +32,33 @@ func main() {
 	// Print a nice startup banner
 	printBanner()
 
-	// Set up the document store (JSONL output)
-	store, err := docstore.NewDocStore(*outputFile)
+	// Build config and run using the public API
+	cfg := crawl.CrawlConfig{
+		SeedURL:    *seedURL,
+		MaxDepth:   *maxDepth,
+		MaxPages:   *maxPages,
+		Workers:    *workers,
+		Timeout:    *timeout,
+		CrawlDelay: *crawlDelay,
+		OutputPath: *outputFile,
+	}
+
+	result, err := crawl.Run(cfg)
 	if err != nil {
-		log.Fatalf("[ERROR] Failed to create document store: %v", err)
-	}
-	defer store.Close()
-
-	log.Printf("[INFO]  Output file: %s (append mode)", *outputFile)
-
-	// Create the crawler and wire up the extraction pipeline
-	c := crawler.NewCrawler(cfg)
-
-	// Wire: Crawler → Extractor → Document Store
-	c.OnPageFetched = func(pageURL string, body string, statusCode int) {
-		doc := extractor.Extract(pageURL, body, statusCode)
-		if err := store.Save(doc); err != nil {
-			log.Printf("[ERROR] Failed to save document for %s: %v", pageURL, err)
-		}
+		log.Fatalf("[ERROR] Crawl failed: %v", err)
 	}
 
-	c.Run()
-
-	log.Printf("[INFO]  Crawl completed! %d documents saved to %s", store.Count(), *outputFile)
+	// Print summary
+	fmt.Println()
+	fmt.Println("===========================================")
+	fmt.Println("          CRAWL COMPLETE")
+	fmt.Println("===========================================")
+	fmt.Printf("  Documents Written:  %d\n", result.DocumentsWritten)
+	fmt.Printf("  Pages Visited:      %d\n", result.PagesVisited)
+	fmt.Printf("  Pages Failed:       %d\n", result.PagesFailed)
+	fmt.Printf("  Duration:           %v\n", result.Duration.Round(time.Millisecond))
+	fmt.Printf("  Output:             %s\n", result.OutputPath)
+	fmt.Println("===========================================")
 }
 
 // printBanner displays a startup message

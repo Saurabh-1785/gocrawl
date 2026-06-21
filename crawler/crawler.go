@@ -120,3 +120,16 @@ func (c *Crawler) printReport() {
 	}
 	fmt.Println()
 }
+
+// Stats returns the crawler's statistics. Use after Run() completes
+// to get final metrics (pages crawled, errors, etc.).
+func (c *Crawler) Stats() *CrawlStats {
+	return c.stats
+}
+
+// GetStartTime safely reads the start time.
+func (s *CrawlStats) GetStartTime() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.StartTime
+}

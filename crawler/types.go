@@ -60,6 +60,20 @@ func (s *CrawlStats) GetCrawledCount() int {
 	return s.PagesCrawled
 }
 
+// GetErrorCount safely reads the error count.
+func (s *CrawlStats) GetErrorCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Errors
+}
+
+// GetSkippedCount safely reads the skipped page count.
+func (s *CrawlStats) GetSkippedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.PagesSkipped
+}
+
 // NewCrawlStats creates a new CrawlStats with the start time set to now.
 func NewCrawlStats() *CrawlStats {
 	return &CrawlStats{
