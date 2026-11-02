@@ -12,9 +12,7 @@
    - 3.1 [urlutil](#31-urlutil-package)
    - 3.2 [fetcher](#32-fetcher-package)
    - 3.3 [parser](#33-parser-package)
-   - 3.4 [ratelimiter (standalone)](#34-ratelimiter-standalone-package)
-   - 3.5 [tracker](#35-tracker-package)
-   - 3.6 [crawler (unit + integration)](#36-crawler-package-unit--integration)
+   - 3.4 [crawler (unit + integration)](#34-crawler-package-unit--integration)
 4. [Run ALL Unit Tests at Once](#4-run-all-unit-tests-at-once)
 5. [Race Condition Detection](#5-race-condition-detection)
 6. [Test Coverage Report](#6-test-coverage-report)
@@ -218,51 +216,7 @@ go test ./parser/ -v
 
 ---
 
-### 3.4 `ratelimiter` (Standalone Package)
-
-**File**: `ratelimiter/ratelimiter_test.go`  
-**Functions tested**: `NewRateLimiter`, `Wait`
-
-```bash
-go test ./ratelimiter/ -v
-```
-
-**Expected**: All tests PASS:
-
-| Test Name | What It Verifies |
-|---|---|
-| `TestRateLimiterDelay` | 1st request instant, 2nd request to same domain is delayed |
-| `TestRateLimiterDifferentDomains` | Different domains are NOT delayed by each other |
-| `TestRateLimiterZeroDelay` | Zero delay = no waiting at all |
-
-**What this implies**: Per-domain rate limiting works correctly. The crawler won't overwhelm a single website.
-
----
-
-### 3.5 `tracker` Package
-
-**File**: `tracker/visited_test.go`  
-**Functions tested**: `MarkVisited`, `IsVisited`, `Count`, `GetAll`
-
-```bash
-go test ./tracker/ -v
-```
-
-**Expected**: All tests PASS:
-
-| Test Name | What It Verifies |
-|---|---|
-| `TestMarkVisited` | First mark → true (new), second mark → false (dup), different URL → true |
-| `TestIsVisited` | Returns false before marking, true after marking |
-| `TestCount` | Correct count, duplicates don't increase count |
-| `TestConcurrentAccess` | 100 goroutines × 10 URLs → exactly 10 unique URLs (no race) |
-| `TestGetAll` | Returns all visited URLs as a slice |
-
-**What this implies**: The visited URL tracker is thread-safe and correctly deduplicates URLs across concurrent goroutines.
-
----
-
-### 3.6 `crawler` Package (Unit + Integration)
+### 3.4 `crawler` Package (Unit + Integration)
 
 **File**: `crawler/crawler_test.go`  
 **Functions tested**: `VisitedStore`, `RateLimiter`, full `Crawler.Run()` with httptest servers
@@ -361,8 +315,6 @@ go test ./... -cover
 ok      github.com/Saurabh-1785/gocrawl/crawler       1.234s  coverage: 75.0% of statements
 ok      github.com/Saurabh-1785/gocrawl/fetcher        0.567s  coverage: 85.0% of statements
 ok      github.com/Saurabh-1785/gocrawl/parser          0.123s  coverage: 90.0% of statements
-ok      github.com/Saurabh-1785/gocrawl/ratelimiter     0.234s  coverage: 95.0% of statements
-ok      github.com/Saurabh-1785/gocrawl/tracker         0.123s  coverage: 100.0% of statements
 ok      github.com/Saurabh-1785/gocrawl/urlutil         0.123s  coverage: 92.0% of statements
 ```
 
@@ -688,8 +640,6 @@ Print this and check off each item:
 - [ ] `go test ./urlutil/ -v` — ALL PASS
 - [ ] `go test ./fetcher/ -v` — ALL PASS
 - [ ] `go test ./parser/ -v` — ALL PASS
-- [ ] `go test ./ratelimiter/ -v` — ALL PASS
-- [ ] `go test ./tracker/ -v` — ALL PASS
 - [ ] `go test ./crawler/ -v` — ALL PASS
 - [ ] `go test ./... -v` — ALL PASS (full suite)
 

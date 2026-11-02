@@ -42,8 +42,7 @@ Each worker pulls a task → checks limits → fetches the page → extracts lin
 gocrawl/
 ├── main.go                 # Entry point, CLI flag parsing
 ├── config/
-│   ├── config.go           # Configuration validation
-│   └── types.go            # CrawlTask, CrawlResult, CrawlStats types
+│   └── config.go           # Configuration validation
 ├── crawler/
 │   ├── crawler.go          # Crawler engine, Run() orchestration
 │   ├── worker.go           # Worker goroutine logic
@@ -57,19 +56,9 @@ gocrawl/
 ├── parser/
 │   ├── parser.go           # HTML link extraction via DOM traversal
 │   └── parser_test.go      # Parser tests
-├── urlutil/
-│   ├── urlutil.go          # URL normalization, resolution, validation
-│   └── urlutil_test.go     # URL utility tests
-├── ratelimiter/
-│   ├── ratelimiter.go      # Standalone rate limiter package
-│   └── ratelimiter_test.go # Rate limiter tests
-├── tracker/
-│   ├── visited.go          # Standalone visited tracker package
-│   └── visited_test.go     # Tracker tests
-├── logger/
-│   └── logger.go           # Leveled logging (INFO, ERROR, DEBUG)
-└── testdata/
-    └── README.md           # Test fixtures directory
+└── urlutil/
+    ├── urlutil.go          # URL normalization, resolution, validation
+    └── urlutil_test.go     # URL utility tests
 ```
 
 ## Quick Start
@@ -211,8 +200,6 @@ go tool cover -html=coverage.out -o coverage.html
 | `urlutil` | 15 | URL normalization, resolution, domain comparison, validation |
 | `fetcher` | 5 | HTTP fetch, status codes, content-type, timeout, User-Agent |
 | `parser` | 5 | Link extraction, filtering, deduplication, relative URLs, fragments |
-| `ratelimiter` | 3 | Same-domain delay, cross-domain independence, zero delay |
-| `tracker` | 5 | Mark visited, count, concurrent access (100 goroutines), get all |
 | `crawler` | 12 | Visited store, rate limiter, full crawl integration (httptest servers) |
 
 ## Tech Stack
