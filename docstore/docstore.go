@@ -3,101 +3,151 @@ package docstore
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"log"
+	"io"
 	"os"
 	"sync"
 
 	"github.com/Saurabh-1785/gocrawl/extractor"
 )
 
-// DocStore handles writing Document records to a JSONL file.
-// It is thread-safe and appends to the file (never truncates).
-// It also deduplicates documents by ID within a session.
+// DocStore writes Documents to a JSONL file: one JSON object per line.
 //
-// JSONL format: one JSON object per line, easy to stream and parse.
+//   - Thread-safe: many workers can call Save at once.
+//   - Append-only: the file is never truncated.
+//   - Deduplicated by document ID, including documents written by EARLIER
+//     runs: the IDs already in the file are loaded when it is opened.
+//   - Crash-tolerant: each document is flushed to the OS right away, and a
+//     line left half-written by a crash is closed off on the next open.
 type DocStore struct {
 	mu      sync.Mutex
 	file    *os.File
 	writer  *bufio.Writer
-	seen    map[string]bool // tracks document IDs to prevent duplicates
-	count   int             // number of documents written in this session
-	skipped int             // number of duplicate documents skipped
+	seen    map[string]bool // IDs already in the file
+	count   int             // documents written by this DocStore
+	skipped int             // duplicates skipped by this DocStore
 }
 
-// NewDocStore creates a new DocStore that appends to the given file path.
-// If the file doesn't exist, it is created.
-// If the file already exists, new documents are appended to the end.
-func NewDocStore(filepath string) (*DocStore, error) {
-	// Open file in append mode: O_APPEND ensures writes go to end,
-	// O_CREATE creates the file if it doesn't exist,
-	// O_WRONLY opens for writing only.
-	file, err := os.OpenFile(filepath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+// NewDocStore opens (or creates) the JSONL file at path for appending.
+func NewDocStore(path string) (*DocStore, error) {
+	seen, needsNewline, err := loadIDs(path)
 	if err != nil {
-		return nil, fmt.Errorf("failed to open docstore file %s: %v", filepath, err)
+		return nil, fmt.Errorf("failed to read existing docstore file %s: %w", path, err)
 	}
 
-	return &DocStore{
-		file:   file,
-		writer: bufio.NewWriter(file),
-		seen:   make(map[string]bool),
-	}, nil
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open docstore file %s: %w", path, err)
+	}
+
+	ds := &DocStore{file: file, writer: bufio.NewWriter(file), seen: seen}
+
+	// A crash in the middle of a write leaves a last line with no "\n".
+	// Close it off, so the next document starts on its own line.
+	if needsNewline {
+		if _, err := file.Write([]byte{'\n'}); err != nil {
+			file.Close()
+			return nil, fmt.Errorf("failed to repair docstore file %s: %w", path, err)
+		}
+	}
+	return ds, nil
 }
 
-// Save writes a single Document as a JSON line to the file.
-// Thread-safe: multiple workers can call Save concurrently.
-// Skips documents with IDs that have already been written in this session.
+// loadIDs reads the IDs of documents already in the file.
+// Lines that aren't valid JSON (e.g. cut off by a crash) are ignored.
+// needsNewline is true when the file doesn't end with "\n".
+func loadIDs(path string) (seen map[string]bool, needsNewline bool, err error) {
+	seen = make(map[string]bool)
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return seen, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	defer f.Close()
+
+	r := bufio.NewReaderSize(f, 1<<20)
+	for {
+		line, err := r.ReadBytes('\n') // no line-length limit, unlike bufio.Scanner
+		if len(line) > 0 {
+			needsNewline = line[len(line)-1] != '\n'
+			var doc struct {
+				ID string `json:"id"`
+			}
+			if json.Unmarshal(line, &doc) == nil && doc.ID != "" {
+				seen[doc.ID] = true
+			}
+		}
+		if err == io.EOF {
+			return seen, needsNewline, nil
+		}
+		if err != nil {
+			return nil, false, err
+		}
+	}
+}
+
+// Save writes one Document as a JSON line.
+// A document whose ID is already in the file is skipped (returns nil).
 func (ds *DocStore) Save(doc extractor.Document) error {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 
-	// Skip duplicate documents (same normalized URL → same ID)
 	if ds.seen[doc.ID] {
 		ds.skipped++
 		return nil
 	}
-	ds.seen[doc.ID] = true
 
-	// Marshal the document to JSON (compact, single line)
 	data, err := json.Marshal(doc)
 	if err != nil {
-		return fmt.Errorf("failed to marshal document: %v", err)
+		return fmt.Errorf("failed to marshal document: %w", err)
 	}
+	data = append(data, '\n')
 
-	// Write the JSON line followed by a newline
 	if _, err := ds.writer.Write(data); err != nil {
-		return fmt.Errorf("failed to write document: %v", err)
+		return fmt.Errorf("failed to write document: %w", err)
 	}
-	if err := ds.writer.WriteByte('\n'); err != nil {
-		return fmt.Errorf("failed to write newline: %v", err)
-	}
-
-	// Flush after each document to ensure data is written to disk
-	// even if the process crashes. The mutex protects the flush too.
+	// Flush after each document: it then survives a crash of THIS program.
+	// (Surviving a power cut needs fsync; Close does that once at the end.)
 	if err := ds.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush: %v", err)
+		return fmt.Errorf("failed to flush: %w", err)
 	}
 
+	// Mark as seen only once it's really written, so a failed write
+	// doesn't block a later retry of the same document.
+	ds.seen[doc.ID] = true
 	ds.count++
 	return nil
 }
 
-// Close flushes any buffered data and closes the file.
+// Close flushes, syncs the file to disk, and closes it.
 func (ds *DocStore) Close() error {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 
 	if err := ds.writer.Flush(); err != nil {
-		return fmt.Errorf("failed to flush on close: %v", err)
+		ds.file.Close()
+		return fmt.Errorf("failed to flush on close: %w", err)
 	}
-
-	log.Printf("[INFO]  DocStore: wrote %d documents, skipped %d duplicates", ds.count, ds.skipped)
+	if err := ds.file.Sync(); err != nil {
+		ds.file.Close()
+		return fmt.Errorf("failed to sync on close: %w", err)
+	}
 	return ds.file.Close()
 }
 
-// Count returns the number of documents written in this session.
+// Count returns the number of documents written by this DocStore.
 func (ds *DocStore) Count() int {
 	ds.mu.Lock()
 	defer ds.mu.Unlock()
 	return ds.count
+}
+
+// Skipped returns the number of duplicate documents skipped by this DocStore.
+func (ds *DocStore) Skipped() int {
+	ds.mu.Lock()
+	defer ds.mu.Unlock()
+	return ds.skipped
 }

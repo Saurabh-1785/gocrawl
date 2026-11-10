@@ -2,9 +2,9 @@
 
 GoCrawl is a concurrent web crawler written in Go. You give it a starting URL. It visits the pages of that website, pulls out clean text, and hands each page to your code or saves it to a file. The search engine **go-search** uses it as a library to get its documents.
 
-**How to use this doc:** read sections 1–4 to understand the system. Section 5 follows one real crawl from start to end. Sections 6–7 explain each part and the concurrency. Section 9 lists real bugs, which is what a good interviewer will find. Section 11 is the question bank, and section 12 is a one-page cheat sheet for the night before.
+**How to use this doc:** read sections 1–4 to understand the system. Section 5 follows one real crawl from start to end. Sections 6–7 explain each part and the concurrency. Section 9 is the story of the bugs I found, measured and fixed, which is the strongest thing to talk about in an interview. Section 11 is the question bank, and section 12 is a one-page cheat sheet for the night before.
 
-**Everything here was checked against the code at commit `5a85a93`.** Numbers marked "measured" came from running the real code against local test servers, so read timings as approximate. Where the code and the ideal design differ, this doc says so.
+**Everything here was checked against the code.** Numbers marked "measured" came from running the real code against local test servers, so read timings as approximate.
 
 ---
 
@@ -18,8 +18,8 @@ GoCrawl is a concurrent web crawler written in Go. You give it a starting URL. I
 6. [Component deep-dives](#6-component-deep-dives)
 7. [Concurrency, end to end](#7-concurrency-end-to-end)
 8. [Testing](#8-testing)
-9. [Known bugs and limitations](#9-known-bugs-and-limitations)
-10. [How it would scale](#10-how-it-would-scale)
+9. [Bugs I found and fixed](#9-bugs-i-found-and-fixed)
+10. [Limits today, and how it would scale](#10-limits-today-and-how-it-would-scale)
 11. [Interview Q&A](#11-interview-qa)
 12. [Cheat sheet](#12-cheat-sheet)
 
@@ -27,22 +27,24 @@ GoCrawl is a concurrent web crawler written in Go. You give it a starting URL. I
 
 ## 1. The 30-second pitch
 
-> "GoCrawl is a concurrent web crawler in Go. It uses a **worker pool**: a fixed number of goroutines pull URLs from a **buffered channel**, fetch the page, extract its links, and push new links back onto the same channel. Because the channel is first-in-first-out, the crawl goes roughly **breadth-first**. A **thread-safe visited set** stops a page being crawled twice, and a **per-domain rate limiter** avoids hammering the site. Each page goes through an **extractor** that strips the HTML and produces a clean document, which is streamed to a **callback** or appended to a **JSONL file**. It is also a library: my search engine imports it and indexes pages as they arrive."
+> "GoCrawl is a concurrent web crawler in Go. A fixed pool of **worker goroutines** takes URLs from a **frontier**: a queue protected by one mutex and a condition variable. Each worker fetches a page, extracts its links and pushes new ones back. The frontier dedupes every URL atomically, reserves a page slot before each fetch so the page limit is exact, and knows when the crawl is over. It's **polite**: it obeys **robots.txt** and a per-domain **rate limiter** that hands out time slots. It's **fault tolerant**: timeouts and 5xx errors are **retried with backoff**, Ctrl-C stops cleanly, and progress is saved to an **atomic checkpoint**, so a crawl can be **resumed** without losing or repeating work. Pages become clean documents that stream to a **callback** or a **JSONL file**. My search engine imports it as a library."
 
-Then add this, because knowing your own weak spots shows ownership:
+Then the story, because it shows how you work:
 
-> "When I tested it properly I found real concurrency bugs that the race detector can't catch. For example, with more workers the rate limiter lets requests through in bursts, and the page limit can overshoot. I can show you the cause and the fix."
+> "My first version passed all its tests, even with the race detector. When I tested it with many workers, I found the rate limiter let 94 requests per second through a limit of 10, and the page limit overshot by up to the number of workers. Those are logic races, which the race detector can't see. I measured six bugs like that, fixed them, and added tests that use many workers so they can't come back."
 
 Numbers worth remembering:
 
 | Fact | Value |
 |---|---|
-| Defaults | depth 2, 50 pages, 3 workers, 10s timeout, 1s delay |
-| Queue | Buffered channel, capacity = `MaxPages` |
-| Max page body | 10 MB (extra bytes are cut off silently) |
-| Document ID | SHA-256 of the normalized URL (64 hex characters) |
-| Only external dependency | `golang.org/x/net/html` |
-| Tests | 48 test functions, 75 including subtests; all pass with `-race` |
+| Defaults | depth 2, 50 pages, 3 workers, 10s timeout, 1s delay, 2 retries |
+| Queue | Frontier: no fixed size, each URL queued once |
+| Max page body | 10 MB (bigger pages are rejected, not cut) |
+| Retries | Timeouts, network errors, 429, 5xx; backoff 0.5s, 1s, 2s… plus jitter |
+| Checkpoint | Every 10s and on stop; written to a temp file, then renamed |
+| Document ID | SHA-256 of the normalized URL |
+| Only external dependency | `golang.org/x/net/html` (robots.txt parser is my own) |
+| Tests | 102 test functions, 129 including subtests; all pass with `-race` |
 | Real data I crawled | 1,007 docs from books.toscrape.com, 102 from en.wikipedia.org |
 
 ---
@@ -55,71 +57,76 @@ Think of a team of **researchers mapping a library**.
 
 | Library | GoCrawl |
 |---|---|
-| A tray of index cards, each naming a book to check | **Task channel** (`tasks`) |
-| Researchers who take a card, read the book, and add new cards | **Worker goroutines** |
-| A checklist of books already read | **Visited store** |
-| "Only one visit to each shelf per second" rule | **Rate limiter** |
-| Walking to the shelf and getting the book | **Fetcher** |
+| A supervisor's desk with a tray of index cards, each naming a book | **Frontier** |
+| The supervisor's rule: "never write the same card twice" | Frontier's **seen** set |
+| "Only 50 books today" — a book is booked out before anyone walks to the shelf | Frontier's **page budget** |
+| Researchers who take a card, read the book, and hand in new cards | **Worker goroutines** |
+| A sign-up sheet with one time slot per shelf every second | **Rate limiter** |
+| The library's house rules on the door: "staff only in room B" | **robots.txt** |
+| Walking to the shelf; trying again if it's locked for a moment | **Fetcher + retries** |
 | Copying down every reference in the book | **Parser** |
 | Writing every reference in one standard format | **URL normalizer** |
 | Summarizing the book without the adverts and covers | **Extractor** |
 | The notebook where summaries are kept | **DocStore** (JSONL file) |
-| A counter of cards still out | **`sync.WaitGroup`** |
+| A photo of the desk every 10 seconds, so work can continue tomorrow | **Checkpoint** |
 
-The tricky part: researchers both **take** cards and **add** cards. Knowing when the whole job is finished is harder than it sounds. An empty tray doesn't mean done, because someone may be about to add more. That's why the WaitGroup exists.
+The tricky part: researchers both **take** cards and **add** cards. An empty tray doesn't mean done, because someone may be about to hand in more. The supervisor knows the job is done only when the tray is empty **and** nobody is out reading a book.
 
 ### 2.2 Architecture (draw this on a whiteboard)
 
 ```
-  main.go (CLI flags)        go-search (imports it as a library)
-          │                        │
-          └───────────┬────────────┘
-                      ▼
-              crawl.Run(cfg)              defaults + validation, wires the pipeline
-                      │
-                      ▼
-              crawler.Run()               creates the channel and N workers
-                      │
-      ┌───────────────┼───────────────┐
-      ▼               ▼               ▼
-  Worker 1        Worker 2        Worker N
-      ▲               ▲               ▲
-      └───────┬───────┴───────┬───────┘
-              │               │
-   take task  │               │  add new links
-              │               │
-        ┌─────┴───────────────┴─────┐
-        │  tasks channel (FIFO)     │
-        │  capacity = MaxPages      │
-        └───────────────────────────┘
+  main.go (CLI flags, Ctrl-C)      go-search (imports it as a library)
+          │                                │
+          └───────────────┬────────────────┘
+                          ▼
+              crawl.RunContext(ctx, cfg)     defaults, validation, wires the pipeline
+                          ▼
+              Crawler.RunContext(ctx)        seed (or checkpoint), N workers, checkpoints
+                          │
+        ┌─────────────────┼─────────────────┐
+        ▼                 ▼                 ▼
+    Worker 1          Worker 2          Worker N
+        │  Next()         │                 │      ▲ Push(new link)
+        ▼                 ▼                 ▼      │
+   ┌────────────────────────────────────────────────┴───┐
+   │ FRONTIER  (one mutex + sync.Cond)                   │
+   │   queue []CrawlTask   FIFO → breadth-first          │
+   │   seen  map[key]bool  each URL queued once          │
+   │   inFlight + done     page budget, end of crawl     │
+   └──────────────────────────┬──────────────────────────┘
+                              │ Snapshot() every 10s
+                              ▼
+                     crawl.state (checkpoint)
 
   What one worker does with one task:
 
-  check limits → MarkVisited → rate limit wait → FetchPage → ExtractLinks
-                                                                  │
-                     ┌────────────────────────────────────────────┤
-                     ▼                                            ▼
-           OnPageFetched callback                        for each link:
-                     │                                   same domain? not visited?
-                     ▼                                   depth OK? → send to channel
-           extractor.Extract → Document
-                     │
-           ┌─────────┴─────────┐
-           ▼                   ▼
-      OnDocument()      DocStore.Save()
-      (your code)       (JSONL file)
+  rate-limit slot → fetch (retry on 5xx/timeout) → parse HTML ONCE → links
+                                                              │
+                ┌─────────────────────────────────────────────┤
+                ▼                                             ▼
+        OnPage callback                              for each link:
+                │                                    same site? not seen?
+                ▼                                    depth OK? robots.txt OK?
+     extractor.ExtractNode → Document                → frontier.Push
+                │
+       ┌────────┴────────┐
+       ▼                 ▼
+  OnDocument()     DocStore.Save()
+  (your code)      (JSONL, deduped)
 ```
 
-**The one sentence to remember:** a task flows *channel → limits → visited check → rate limiter → fetch → parse links → extract text → store*, and the new links go back into the channel.
+**The one sentence to remember:** a worker asks the frontier for a task, waits for its rate-limit slot, fetches (retrying temporary failures), parses once, hands the page on, and pushes new links back; the frontier dedupes, enforces the page limit and decides when the crawl ends.
 
 ### 2.3 What makes the design good
 
 | Choice | Why |
 |---|---|
-| Worker pool, fixed N | Bounds open connections and memory. One goroutine per URL would explode on a big site. |
-| Channel as the queue | Go gives you a thread-safe FIFO for free. |
-| Callback for output | The crawler doesn't know about extractors or search indexes. Anyone can plug in. |
-| Small packages | Fetcher, parser and URL utils can each be tested alone. |
+| Worker pool, fixed N | Bounds open connections and memory |
+| One structure owns the queue, seen set and budget | One lock means every check-then-act is atomic, and a checkpoint snapshot is consistent |
+| `sync.Cond` instead of a channel | Push never blocks, so no deadlock and no dropped links |
+| Callback for output | The crawler knows nothing about extractors or search indexes |
+| Small packages | Fetcher, parser, robots, URL rules can each be tested alone |
+| Context everywhere | One `cancel()` stops waits, sleeps, retries and HTTP requests |
 
 ---
 
@@ -127,28 +134,30 @@ The tricky part: researchers both **take** cards and **add** cards. Knowing when
 
 ```
 gocrawl/
-├── main.go                 CLI: parse flags, call crawl.Run, print summary
-├── crawl/crawl.go          PUBLIC API: CrawlConfig, CrawlResult, Run()
-├── config/config.go        Internal Config + ValidateConfig
+├── main.go                 CLI: flags, Ctrl-C handling, summary
+├── crawl/crawl.go          PUBLIC API: CrawlConfig, DefaultConfig, Run, RunContext
+├── config/config.go        Internal Config (literal values) + ValidateConfig
 ├── crawler/                The engine
-│   ├── crawler.go          Crawler struct, Run(), printReport()
-│   ├── worker.go           worker loop and processTask (the heart of the project)
-│   ├── visited.go          VisitedStore: thread-safe set of URLs
-│   ├── ratelimiter.go      RateLimiter: per-domain delay
-│   └── types.go            CrawlTask, CrawlStats
-├── fetcher/fetcher.go      HTTP GET with timeout, status, content-type and size checks
-├── parser/parser.go        Finds <a href> links in the HTML tree
-├── urlutil/urlutil.go      Normalize, resolve, same-domain check, scheme check
+│   ├── crawler.go          Crawler, RunContext, Stop, site + robots checks
+│   ├── worker.go           worker loop, processTask, consider, fetchWithRetry, backoff
+│   ├── frontier.go         The queue: dedupe, page budget, end detection, snapshots
+│   ├── ratelimiter.go      Per-domain time slots
+│   ├── checkpoint.go       Save (atomic) / restore / periodic checkpoints
+│   └── types.go            CrawlTask, Page, CrawlStats
+├── fetcher/fetcher.go      HTTP GET: timeout, status, type, size, redirects, typed errors
+├── robots/robots.go        robots.txt parser (RFC 9309) + per-site cache
+├── parser/parser.go        Finds <a href> links (and <base href>)
+├── urlutil/urlutil.go      Normalize, resolve, same-site check
 ├── extractor/extractor.go  HTML → Document (title + clean text + SHA-256 ID)
-└── docstore/docstore.go    Appends Documents to a JSONL file
+└── docstore/docstore.go    Appends Documents to a JSONL file, deduped across runs
 ```
 
 **Dependency direction:**
 
 ```
-main → crawl → { config, crawler, docstore, extractor }
-                     crawler → { config, fetcher, parser, urlutil }
-                     parser → urlutil
+main → crawl → { config, crawler, docstore, extractor, fetcher }
+                     crawler → { config, fetcher, parser, robots, urlutil }
+                     parser → urlutil        extractor → urlutil
                      docstore → extractor
 ```
 
@@ -166,18 +175,31 @@ go build -o gocrawl .
 | Flag | Default | Meaning |
 |---|---|---|
 | `-url` | required | Starting URL |
-| `-depth` | `2` | How many links deep to follow |
-| `-pages` | `50` | Maximum pages to crawl |
+| `-depth` | `2` | How many links deep to follow (`0` = seed only) |
+| `-pages` | `50` | Maximum HTML pages to fetch |
 | `-workers` | `3` | Number of worker goroutines |
-| `-timeout` | `10s` | Time limit per page |
-| `-delay` | `1s` | Minimum gap between requests to one domain |
-| `-output` | `output.jsonl` | Output file. Appends, never overwrites |
+| `-timeout` | `10s` | Time limit per request |
+| `-delay` | `1s` | Minimum gap between requests to one domain (`0` = none) |
+| `-retries` | `2` | Extra attempts for timeouts, 429 and 5xx (`0` = none) |
+| `-output` | `output.jsonl` | Output file. Appends; documents already in it are skipped |
+| `-checkpoint` | none | File to save progress to, e.g. `crawl.state` |
+| `-resume` | off | Continue from the checkpoint |
+| `-ignore-robots` | off | Skip robots.txt (only for sites you own) |
+| `-user-agent` | `GoCrawl/1.0` | User-Agent header |
 
-**Warning:** `-depth 0` and `-delay 0s` don't work today. See [bug 1](#bug-1-zero-values-are-replaced-by-defaults).
+### Stop and resume
+
+```bash
+./gocrawl -url https://books.toscrape.com -pages 200 -checkpoint books.state -output books.jsonl
+# press Ctrl-C at any time → "CRAWL INTERRUPTED ... Resume with: -checkpoint books.state -resume"
+./gocrawl -url https://books.toscrape.com -pages 200 -checkpoint books.state -output books.jsonl -resume
+```
+
+Measured: a 30-page site, interrupted after 13 pages, then resumed: 17 more pages, **30 unique documents, no duplicates**, and the checkpoint file was removed once the crawl was complete.
 
 ### Using it as a library
 
-This is what go-search does. It's simplified from `go-search/crawl_job.go`:
+This is what go-search does (simplified):
 
 ```go
 docCh := make(chan extractor.Document, 64)
@@ -187,27 +209,39 @@ go func() {
     }
 }()
 
-result, err := crawl.Run(crawl.CrawlConfig{
-    SeedURL:    "https://example.com",
-    MaxPages:   100,
-    OnDocument: func(doc extractor.Document) { docCh <- doc },
-})
+cfg := crawl.DefaultConfig()
+cfg.SeedURL = "https://example.com"
+cfg.MaxPages = 100
+cfg.OnDocument = func(doc extractor.Document) { docCh <- doc }
+
+result, err := crawl.RunContext(ctx, cfg) // cancel ctx to stop it
 close(docCh) // safe: every callback has returned once Run returns
 ```
 
-`OnDocument` runs inside the worker goroutine. So it must be thread-safe, and if it's slow, it holds up that worker. The channel above gives natural **backpressure**: when indexing falls behind, workers wait.
+**Zero values, decided on purpose:**
+
+| Field | `0` means | To turn it off |
+|---|---|---|
+| `MaxDepth` | seed page only (a real value) | — |
+| `CrawlDelay` | polite default, 1s | `crawl.NoDelay` |
+| `MaxRetries` | default, 2 | `crawl.NoRetries` |
+| `MaxPages`, `Workers`, `Timeout` | defaults (0 makes no sense) | — |
+
+Why the delay is different: a library caller who forgets to set it must get a polite crawler, not one that hammers a site. **Safety settings fail safe.**
+
+`OnDocument` runs inside worker goroutines. It must be thread-safe, and if it's slow it holds up that worker. The channel gives natural **backpressure**.
 
 ---
 
 ## 5. One real crawl, step by step
 
-This is a real run of the code against a small local site.
+A real run against a small local site:
 
 ```
 /                   links to: /about (in <nav>), /about#team, /blog/,
                               https://other.com/x, mailto:a@b.c
 /about              links to: /, /logo.png
-/blog               links to: post-1 (relative), /blog/post-1, /blog/index.html
+/blog/              links to: post-1 (relative), /blog/post-1, /blog/index.html
 /blog/post-1        links to: /blog/post-1/deep
 /blog/post-1/deep   no links
 ```
@@ -219,279 +253,250 @@ This is a real run of the code against a small local site.
 ### The real log
 
 ```
+[INFO]  Config: depth=2, pages=50, workers=1, delay=100ms, retries=2, robots=true
 [INFO]  [Worker 1] Crawling: http://localhost:8099/ (depth: 0)
 [DEBUG] [Worker 1] Found 3 links on http://localhost:8099/
 [INFO]  [Worker 1] Crawling: http://localhost:8099/about (depth: 1)
 [DEBUG] [Worker 1] Found 2 links on http://localhost:8099/about
-[INFO]  [Worker 1] Crawling: http://localhost:8099/blog (depth: 1)
-[DEBUG] [Worker 1] Found 3 links on http://localhost:8099/blog
+[INFO]  [Worker 1] Crawling: http://localhost:8099/blog/ (depth: 1)
+[DEBUG] [Worker 1] Found 2 links on http://localhost:8099/blog/
 [INFO]  [Worker 1] Crawling: http://localhost:8099/logo.png (depth: 2)
-[ERROR] [Worker 1] Error fetching http://localhost:8099/logo.png: not an HTML page (content-type: image/png)
-[INFO]  [Worker 1] Crawling: http://localhost:8099/post-1 (depth: 2)
-[ERROR] [Worker 1] Error fetching http://localhost:8099/post-1: non-200 status code: 404
+[INFO]  [Worker 1] Skipped http://localhost:8099/logo.png: not an HTML page (content-type: image/png)
 [INFO]  [Worker 1] Crawling: http://localhost:8099/blog/post-1 (depth: 2)
 [DEBUG] [Worker 1] Found 1 links on http://localhost:8099/blog/post-1
 
-  Pages Crawled:  4
-  Pages Skipped:  0
-  Errors:         2
-  Unique URLs:    6
-  Time Elapsed:   505ms
+  Pages Visited:      4
+  Pages Failed:       0
+  Pages Skipped:      1
+  Unique URLs:        5
+  Duration:           408ms
 ```
 
-Notice the order: depth 0, 1, 1, 2, 2, 2. That's breadth-first, and it comes from the FIFO channel.
+Order: depth 0, 1, 1, 2, 2. That's breadth-first, from the FIFO queue.
 
 ### What happened at each page
 
-| Task | Links found (after normalizing) | What was done with them | Queue afterwards |
+| Task | Links found | What was done with them | Queue afterwards |
 |---|---|---|---|
-| `/` (d0) | `/about`, `/blog`, `other.com/x` | `mailto:` removed by the parser. `/about#team` became `/about`, merged as a duplicate. `/blog/` became `/blog`. `other.com` dropped: different domain. | `/about`, `/blog` |
-| `/about` (d1) | `/`, `/logo.png` | `/` already visited. | `/blog`, `/logo.png` |
-| `/blog` (d1) | `/post-1`, `/blog/post-1`, `/blog` | `/blog/index.html` became `/blog`, already visited. | `/logo.png`, `/post-1`, `/blog/post-1` |
-| `/logo.png` (d2) | | Wrong content type. Counted as an error. | `/post-1`, `/blog/post-1` |
-| `/post-1` (d2) | | **404. This is a bug**, see below. | `/blog/post-1` |
-| `/blog/post-1` (d2) | `/blog/post-1/deep` | Would be depth 3, over the limit, so never queued. | empty, so the crawl ends |
+| `/` (d0) | `/about`, `/blog/`, `other.com/x` | Before this: robots.txt fetched once (404 → everything allowed). `mailto:` dropped by the parser. `/about#team` is the same key as `/about`, counted once. `other.com` dropped: not our site. | `/about`, `/blog/` |
+| `/about` (d1) | `/`, `/logo.png` | `/` already seen. | `/blog/`, `/logo.png` |
+| `/blog/` (d1) | `/blog/post-1`, `/blog/` | `post-1` resolved against `/blog/` → `/blog/post-1`. `/blog/index.html` has the same key as `/blog/`, counted once. | `/logo.png`, `/blog/post-1` |
+| `/logo.png` (d2) | | Not HTML: counted as **skipped**, not error. Its page slot is given back. | `/blog/post-1` |
+| `/blog/post-1` (d2) | `/blog/post-1/deep` | Would be depth 3: never queued. | empty, nothing in flight → crawl ends |
 
-**The bug this run exposed:** the page at `/blog/` has a relative link `post-1`, which should mean `/blog/post-1`. But the crawler removed the trailing slash, so it used `/blog` as the base, and `post-1` resolved to `/post-1`, which doesn't exist. See [bug 6](#bug-6-removing-the-trailing-slash-breaks-relative-links).
+**Key detail:** the queue holds `/blog/` **with** its trailing slash, as the author wrote it. The dedupe key is `/blog` (normalized). Fetch URL and dedupe key are kept separate on purpose; mixing them was bug 6.
 
-**Time check:** 505ms is about 5 waits of 100ms each, because the first request doesn't wait. With one worker the rate limiter behaves exactly as designed.
+**Time check:** 408ms ≈ 4 gaps of 100ms (the first request doesn't wait).
 
-**Why 6 unique URLs but 4 crawled?** A URL is marked visited *before* it's fetched, so failed URLs are in the set too.
+**Run it again into the same file:** `Documents Written: 0, Already in File: 4`. The DocStore loads existing IDs when it opens.
 
 ### The real output (`out.jsonl`)
 
-One JSON object per line:
-
 ```json
-{"id":"67fe89df224a4f7347a89ab939082a6249bba763fb7d1d3665128cfa92d9afe6","url":"http://localhost:8099/","domain":"localhost","title":"Home","content":"Welcome Hello crawler.","status_code":200,"content_length":22,"timestamp":1793609344}
+{"id":"67fe89df224a...","url":"http://localhost:8099/","domain":"localhost","title":"Home","content":"Welcome Hello crawler.","status_code":200,"content_length":22,"timestamp":1793609344}
 ```
 
-The home page HTML had a `<nav>`, links and a `<script>`. None of that is in `content`. Only `Welcome` (from `<h1>`) and `Hello crawler.` (from `<p>`) are kept.
+The home page had a `<nav>`, links and a `<script>`. None of that is in `content`.
 
 ---
 
 ## 6. Component deep-dives
 
-### 6.1 `crawl.Run`: the public API ([crawl/crawl.go](../crawl/crawl.go))
+### 6.1 `crawl.RunContext`: the public API ([crawl/crawl.go](../crawl/crawl.go))
 
-It does four things:
-
-1. Fill in defaults, then validate the config.
+1. Apply defaults (`toInternal`) and validate.
 2. Open the DocStore if `OutputPath` is set.
-3. Set `OnPageFetched`, the callback that connects crawler → extractor → your code and the file ([line 114](../crawl/crawl.go#L114)).
-4. Run the crawl (this blocks), then build a `CrawlResult`.
+3. Set `OnPage`: page → `extractor.ExtractNode` → `OnDocument` and/or `DocStore.Save`.
+4. If `Save` fails (disk full), call `c.Stop(err)`: the crawl stops and returns the error, instead of losing every page after it.
+5. Run, then build `CrawlResult` (visited, failed, skipped, robots-blocked, retries, interrupted…).
 
-**Why two config structs?** `CrawlConfig` is the public contract and includes callbacks. `config.Config` is what the engine needs. Keeping them separate lets the internals change without breaking users.
+**Why two config structs?** `CrawlConfig` is the public contract, with defaults and "off" values (`NoDelay`). `config.Config` is literal: 0 means 0. The engine never has to guess.
 
-**Each `Run` builds its own crawler, visited set and rate limiter**, so two crawls can run at the same time without sharing state. One consequence: two crawls of the same site don't know about each other's rate limits.
-
-### 6.2 `Crawler.Run`: starting and stopping ([crawler/crawler.go](../crawler/crawler.go))
+### 6.2 `Crawler.RunContext`: starting and stopping ([crawler/crawler.go](../crawler/crawler.go#L88))
 
 ```go
-tasks := make(chan CrawlTask, c.config.MaxPages)
-var wg sync.WaitGroup
-done := make(chan bool)
+ctx, cancel := context.WithCancel(ctx)        // Stop(err) calls cancel
+if resuming { load checkpoint } else { check robots.txt, push seed }
 
-for i := 1; i <= c.config.Workers; i++ {
-    go c.worker(i, tasks, &wg)          // workers wait on the channel
+stopClose := context.AfterFunc(ctx, c.frontier.Close) // cancel → frontier closes
+var wg sync.WaitGroup                         // counts WORKERS, not tasks
+for i := 1; i <= workers; i++ {
+    wg.Add(1)
+    go func(id int) { defer wg.Done(); c.worker(ctx, id) }(i)
 }
-
-wg.Add(1)                               // count the seed BEFORE sending it
-tasks <- CrawlTask{URL: seedNormalized, Depth: 0}
-
-go func() {
-    wg.Wait()                           // counter = 0 means nothing queued or running
-    close(tasks)                        // workers' "for range" loops end
-    done <- true
-}()
-<-done
-c.printReport()
+stopCheckpoints := c.startCheckpoints()       // save every 10s
+wg.Wait()                                     // all workers exited
+stopCheckpoints()
+c.finishCheckpoint()                          // complete → delete file; else save it
 ```
 
-The WaitGroup here counts **tasks, not workers**. That's the key idea, and section 7 explains why.
-
-**Small cleanup:** the extra goroutine and `done` channel aren't needed. `wg.Wait(); close(tasks)` directly in `Run` does the same thing.
-
-### 6.3 `processTask`: the heart of the project ([crawler/worker.go](../crawler/worker.go#L30))
-
-```
-defer wg.Done()                        ← runs on every return path
-1. Page limit reached?                 → skip
-2. Task deeper than MaxDepth?          → skip
-3. MarkVisited returns false?          → skip (someone else has it)
-4. Page limit check again              → skip
-5. rateLimiter.Wait(url)               ← may sleep
-6. FetchPage                           → on error: count it, return
-7. stats.IncrementCrawled()
-8. ExtractLinks(body, url)
-9. OnPageFetched(url, body, status)    ← extraction and storage happen here
-10. For each link:
-      different domain?   → ignore
-      already visited?    → ignore
-      over page limit?    → stop the loop
-      next depth too big? → ignore
-      wg.Add(1), then try to send to the channel
-      channel full?       → wg.Done(), count as skipped, drop the link
-```
-
-The final send is non-blocking:
+The worker loop is three lines:
 
 ```go
-wg.Add(1)
-select {
-case tasks <- CrawlTask{URL: link, Depth: task.Depth + 1}:
-default:           // channel full: drop the link instead of waiting
-    wg.Done()
-    c.stats.IncrementSkipped()
+for {
+    task, ok := c.frontier.Next()   // blocks; false = crawl over
+    if !ok { return }
+    c.frontier.Done(task, c.processTask(ctx, id, task))
 }
 ```
 
-This `select` is the most important line for **deadlock safety**. Section 7.3 explains it.
-
-### 6.4 `VisitedStore`: the "seen" set ([crawler/visited.go](../crawler/visited.go))
-
-A `map[string]bool` protected by a `sync.RWMutex`.
+### 6.3 The frontier: the heart of the design ([crawler/frontier.go](../crawler/frontier.go))
 
 ```go
-func (v *VisitedStore) MarkVisited(url string) bool {
-    v.mu.Lock()
-    defer v.mu.Unlock()
-    if v.visited[url] { return false }
-    v.visited[url] = true
-    return true
+type frontier struct {
+    mu       sync.Mutex
+    cond     *sync.Cond           // workers sleep here when there's nothing to do
+    queue    []CrawlTask          // FIFO
+    seen     map[string]bool      // every key ever queued
+    inFlight map[string]CrawlTask // being processed right now
+    done     int                  // successful pages
+    maxPages int
+    closed   bool
 }
 ```
 
-**Why one method and not `IsVisited` followed by `Mark`?** Because the check and the write have to be **atomic**. With two separate calls, two workers could both see "not visited" and both fetch the page. Doing both under one lock means exactly one worker gets `true`.
+| Method | What it guarantees |
+|---|---|
+| `Push(task)` | Check-and-set on `seen` under the lock: **each URL is queued once**, however many pages link to it. Never blocks. |
+| `Next()` | Hands out a task only while `done + inFlight < maxPages`: the **slot is reserved before fetching**, so the limit is exact. Blocks on the `Cond` otherwise. Returns false when the crawl is over. |
+| `Done(task, outcome)` | `success` → `done++`. `failed` → the slot is freed for another page. `requeue` (stopped mid-task) → back in the queue for a resume. Wakes all waiters. |
+| `Close()` | Stop handing out work (called on cancel). |
+| `Snapshot()` | Copies queue + in-flight + seen + done **under the one lock**, so a checkpoint is consistent. |
 
-The worker also calls `IsVisited` before queuing a link. That's only an optimization to avoid queuing obvious duplicates. `MarkVisited` is the real gatekeeper.
+**When is the crawl over?** `Next` returns false when:
+- nothing is queued **and** nothing is in flight (an in-flight page might still add links), or
+- `done` has reached `maxPages`, or
+- `Close` was called.
 
-**Cost:** O(1) per check. Memory grows with every URL, and everything is lost when the process exits. There's no way to resume a crawl.
+**Why `sync.Cond`?** Workers need to sleep until "a task arrived" **or** "a slot was freed" **or** "the crawl ended". A channel can carry only the first. A condition variable lets each worker re-check the whole state after any change. The rule: always call `Wait` inside a `for` loop that re-checks the condition, because a wake-up only means "something changed".
 
-### 6.5 `RateLimiter`: being polite ([crawler/ratelimiter.go](../crawler/ratelimiter.go))
+### 6.4 `processTask` ([crawler/worker.go](../crawler/worker.go#L42))
 
-A `map[domain]lastRequestTime` plus a mutex. If the domain was hit recently, it sleeps for the remaining time. It correctly **releases the lock while sleeping**, so other domains don't wait.
+```
+defer recover()                        ← a panic (e.g. in OnPage) fails one page, not the crawl
+1. fetchWithRetry                      → stopped? requeue.  not HTML / redirect refused? skipped.
+                                         other error? failed.
+2. Redirect landed on a seen page?     → skipped ("/blog" → "/blog/" processed once)
+3. Seed redirected to another host?    → that host joins the site (golang.org → go.dev)
+4. html.Parse ONCE                     ← shared by link extraction and the extractor
+5. parser.Links(root, finalURL)        ← resolve against the FINAL URL
+6. OnPage(page)
+7. depth < MaxDepth → consider(link) for each link
+8. stopped during this page?           → requeue (resume does it again); else success
+```
 
-The domain key is `host:port`. Since the crawler stays on one domain, this map really only ever has one entry.
+`consider(link)`: normalize → same site? → already seen? → robots.txt allows? (if not, mark seen and count once) → `Push`.
 
-This has a real bug under concurrency. See [bug 2](#bug-2-the-rate-limiter-bursts-with-more-than-one-worker).
+### 6.5 `RateLimiter`: time slots ([crawler/ratelimiter.go](../crawler/ratelimiter.go#L57))
 
-### 6.6 `FetchPage` ([fetcher/fetcher.go](../fetcher/fetcher.go))
+```go
+r.mu.Lock()
+now := time.Now()
+slot := r.next[domain]
+if slot.Before(now) { slot = now }
+r.next[domain] = slot.Add(delay)   // RESERVE: the next caller queues behind this one
+r.mu.Unlock()
+sleep until slot, or return early if ctx is cancelled
+```
+
+Like taking a numbered ticket at a counter: you get your turn under the lock, then wait without holding it. A robots.txt `Crawl-delay` raises the gap for that host (capped at 30s).
+
+**Insight to say out loud:** for a single site, throughput is capped at `1 / delay`, however many workers you add. Measured: 100ms delay → 10.9 req/s with 1, 3, 5 or 10 workers. Workers help only when page latency is bigger than the delay.
+
+### 6.6 `Fetch` ([fetcher/fetcher.go](../fetcher/fetcher.go#L71))
 
 | Step | Why |
 |---|---|
-| `http.Client{Timeout: timeout}` | Covers the whole request including reading the body. A slow server can't hang a worker forever. |
-| Set `User-Agent: GoCrawl/1.0` | Lets site owners identify the crawler. |
-| Reject status other than 200 | No error pages in the data. |
-| Reject non `text/html` | Checked **before** reading the body, so a linked PDF or image costs almost no bandwidth. |
-| `io.LimitReader(body, 10MB)` | One giant page can't eat all the memory. |
-| `defer resp.Body.Close()` | Otherwise connections leak. |
+| `http.NewRequestWithContext(ctx, …)` | Cancel stops the request |
+| `Client.Timeout` | Covers the whole request, body included |
+| `Transport` nil → `http.DefaultTransport` | Connections are pooled. And go-search installs an SSRF guard there, which we must not bypass |
+| `CheckRedirect` → `AllowRedirect` | Each hop must stay on our site and pass robots.txt |
+| Status ≠ 200 → `*StatusError` (with `Retry-After`) | Callers can tell 404 from 503 |
+| Type check **before** reading body | A linked PDF costs almost nothing |
+| Read `limit + 1` bytes | Tells "exactly 10 MB" from "too big" → `ErrTooLarge`, no silent cut |
+| `resp.Request.URL` → `FinalURL` | The URL after redirects; links resolve against it |
 
-**A subtle detail people get wrong:** a new `http.Client` is created per request, which looks wasteful. It's fine here, because a client with no `Transport` set uses the shared `http.DefaultTransport`, so connections are still reused.
+`IsRetryable(err)`: network errors, timeouts, 429, 5xx → yes. 404, not HTML, too large, refused redirect, cancelled → no.
 
-### 6.7 `ExtractLinks` ([parser/parser.go](../parser/parser.go))
+**Retries** ([`fetchWithRetry`](../crawler/worker.go#L151)): each attempt takes a new rate-limit slot, so retries stay polite. Wait = server's `Retry-After` if given, else 0.5s · 2ⁿ plus up to 50% random **jitter** (so workers don't retry in lock-step), capped at 30s.
 
-`html.Parse` turns the page into a tree. A recursive function walks every node (depth-first). For every `<a href>` it:
+### 6.7 `robots`: being a good citizen ([robots/robots.go](../robots/robots.go))
 
-```
-trim → skip empty, javascript:, mailto:, tel:, "#"
-     → ResolveURL (relative → absolute)
-     → NormalizeURL
-     → IsValidURL (http or https only)
-     → add if not already seen on this page
-```
+Own small parser for **RFC 9309**, no dependency:
 
-**Why a real HTML parser and not a regex?** Real pages have broken HTML, comments, odd quoting, and `<a>` text inside scripts. `html.Parse` follows the HTML5 parsing rules and tolerates all of this.
+| Rule | Example |
+|---|---|
+| Use groups naming our token (`GoCrawl`, any case); else the `*` group | |
+| **Longest match wins**; on a tie, Allow wins | `Disallow: /private` + `Allow: /private/public` → `/private/public` allowed |
+| `*` = any characters, `$` = end of path | `Disallow: /*.pdf$` blocks `/a.pdf`, not `/a.pdf?x=1` |
+| `/robots.txt` itself is always allowed | |
+| `Crawl-delay:` (not standard, but common) | raises the rate-limit gap |
 
-**Fun fact to mention:** there are two traversals in this project. The **page tree** is walked depth-first by recursion, and the **web graph** is walked breadth-first by the queue.
+**When robots.txt can't be read:**
 
-### 6.8 `urlutil`: the URL rules ([urlutil/urlutil.go](../urlutil/urlutil.go))
+| Answer | Meaning |
+|---|---|
+| 2xx | parse it |
+| 4xx (404, 403) | no rules → everything allowed |
+| 5xx, 429, network error | assume **everything disallowed** (the RFC's safe choice) |
 
-**Why normalize?** To a crawler, `HTTP://Example.com/a#top` and `http://example.com/a` look like different strings, but they're the same page. Without normalizing you crawl pages twice.
+The `Cache` fetches once per `scheme://host`. If 20 workers ask at the same moment, one fetches and 19 wait on a `ready` channel. Tested: 20 goroutines → 1 request.
 
-Real outputs from the code:
+### 6.8 `parser.Links` ([parser/parser.go](../parser/parser.go#L23))
 
-| Input | Output | Rule |
+Walks the parsed tree **depth-first** (recursion). For every `<a href>`: skip empty, `#…`, `javascript:`, `mailto:`, `tel:` → resolve against the page's final URL (or its `<base href>`) → keep http(s) with a host → strip the fragment → dedupe by normalized key → return the URL **as written**.
+
+Two traversals in this project: the **page tree** depth-first by recursion, the **web graph** breadth-first by the queue.
+
+### 6.9 `urlutil`: the URL rules ([urlutil/urlutil.go](../urlutil/urlutil.go))
+
+`NormalizeURL` builds the **dedupe key**:
+
+| Input | Key | Rule |
 |---|---|---|
-| `HTTP://Example.COM/Page#section` | `http://example.com/Page` | Lowercase scheme and host, drop the fragment. The path keeps its case, because paths are case-sensitive. |
-| `http://example.com` | `http://example.com/` | Empty path becomes `/` |
-| `http://example.com/blog/` | `http://example.com/blog` | Remove trailing slash |
-| `http://example.com/index.html` | `http://example.com/` | Remove index files |
-| `http://example.com/blog/index.html` | `http://example.com/blog` | Same, in a subfolder |
+| `HTTP://Example.COM/Page#top` | `http://example.com/Page` | lowercase scheme + host, drop fragment; path keeps case |
+| `http://example.com:80/a` | `http://example.com/a` | drop default port |
+| `/blog/`, `/blog/index.html` | `/blog` | trailing slash, index files |
+| `/a?b=2&a=1&utm_source=x` | `/a?a=1&b=2` | sort params, drop tracking (`utm_*`, `gclid`, `fbclid`…) |
 
-**What it does NOT handle** (all measured):
+`IsSameDomain` compares `SiteHost`: lowercase, default port removed, leading `www.` removed. So `www.example.com`, `example.com`, `http` and `https` are one site; `blog.example.com` is another.
 
-| Input | Output | Problem |
-|---|---|---|
-| `http://example.com:80/a` | unchanged | Default port not removed |
-| `?b=2&a=1` vs `?a=1&b=2` | both kept | Same page, crawled twice |
-| `/a?utm_source=x` | unchanged | Tracking parameters create fake new pages |
-| `http://` vs `https://` | both kept | Treated as different pages |
-| `www.example.com` vs `example.com` | both kept | Treated as **different domains** |
-
-`ResolveURL` uses Go's `ResolveReference`, which follows the URL standard:
-
-| Base | Link | Result |
-|---|---|---|
-| `http://example.com/blog/post` | `../about` | `http://example.com/about` |
-| `http://example.com/blog/post` | `next` | `http://example.com/blog/next` |
-| `http://example.com/blog/post/` | `next` | `http://example.com/blog/post/next` |
-| `http://example.com/blog/post` | `/root` | `http://example.com/root` |
-| `http://example.com/blog/post` | `//cdn.com/x` | `http://cdn.com/x` |
-
-Rows 2 and 3 are why the trailing slash matters.
-
-### 6.9 `Extract`: HTML to Document ([extractor/extractor.go](../extractor/extractor.go))
-
-```go
-type Document struct {
-    ID            string // SHA-256 of the normalized URL
-    URL           string
-    Domain        string
-    Title         string // <title>, else first <h1>
-    Content       string // clean text only
-    StatusCode    int
-    ContentLength int    // length of clean text, not raw HTML
-    Timestamp     int64  // Unix seconds
-}
-```
-
-**How text is chosen:** it walks the tree using two lists.
+### 6.10 `extractor` ([extractor/extractor.go](../extractor/extractor.go))
 
 | List | Tags | Action |
 |---|---|---|
-| `skipTags` | `script style noscript nav header footer aside form iframe svg math` | Ignore the whole subtree |
-| `contentTags` | `p h1–h6 li td th blockquote pre figcaption caption dt dd` | Take all text inside, don't go deeper |
-| anything else (`div`, `body`) | | Keep walking into children |
+| `skipTags` | `script style noscript template nav header footer aside iframe svg math select option button` | skip whole subtree |
+| `contentTags` | `p h1–h6 li td th blockquote pre figcaption caption dt dd` | take all text inside |
+| `looseTextParents` | `div section article main body span…` | keep text placed **directly** inside |
+| `blockTags` | `br p div li td tr h1…` | add a space at the edges |
 
-Skipped tags are also checked *inside* content tags. Wikipedia puts `<style>` inside `<p>`, so without this, CSS leaked into the text. The test `hello<style>.a{}</style> world` gives `hello world`.
+So `foo<br>bar` → `foo bar`, but `un<b>believ</b>able` → `unbelievable` (inline tags don't split, same as a browser). `<form>` isn't skipped, because ASP.NET-style sites wrap the whole page in one.
 
-**Why SHA-256 for the ID?** It's **deterministic**: the same URL always gives the same ID, in any run or any machine, with no central counter. It's also a fixed length. It's not for security; a faster hash like xxHash would work too.
+**ID = SHA-256 of the normalized URL:** deterministic (same URL → same ID in every run, on every machine, no counter needed), fixed length. Not for security.
 
-**Limits of this approach** (measured):
-
-| HTML | Content result | Problem |
-|---|---|---|
-| `<td>foo<br>bar</td>` | `foobar` | Words stuck together |
-| `<li><a>Home</a><a>About</a></li>` | `HomeAbout` | Same problem |
-| `<form><p>whole page</p></form>` | *(empty)* | Some sites wrap the whole page in a form |
-| `<div>plain text</div>` | *(empty)* | Text directly in a `div` is lost |
-| `<header><h1>Big Title</h1></header>` | *(no h1 in content)* | Title is still found, content misses it |
-
-This is a heuristic, like a very simple version of Mozilla Readability. It also can't see pages rendered by JavaScript, because it doesn't run a browser.
-
-### 6.10 `DocStore`: the JSONL file ([docstore/docstore.go](../docstore/docstore.go))
-
-**Why JSONL?** One JSON object per line means you can stream it, append to it, and read it line by line without loading it all. If a crash cuts off the last line, the other lines are still fine. A normal JSON array would need closing brackets and a full parse.
+### 6.11 `DocStore` ([docstore/docstore.go](../docstore/docstore.go))
 
 | Feature | How |
 |---|---|
-| Thread safety | One mutex around the whole `Save` |
-| Never overwrites | `O_APPEND` |
-| Dedupe | `seen map[id]bool`, **only within this run** |
-| Crash safety | `Flush` after every document |
+| One JSON object per line | Streamable, appendable, a cut-off last line doesn't ruin the rest |
+| Thread-safe | One mutex around `Save` |
+| Dedupe **across runs** | On open, read every existing `id` (`bufio.Reader`, no line-length limit) |
+| Crash repair | If the file doesn't end in `\n`, write one first |
+| Durability | `Flush` per document (survives a program crash); `fsync` on `Close` (survives power loss at the end) |
 
-**Exact point on durability:** `bufio.Flush` hands the data to the operating system. So it survives the *program* crashing, but not a *power* failure. For that you'd need `file.Sync()` (fsync), which is much slower. Flushing every write also makes the buffer nearly pointless, but it's the safe and simple choice.
+### 6.12 Checkpoints ([crawler/checkpoint.go](../crawler/checkpoint.go))
+
+```json
+{"version":1, "seed":"https://example.com/", "sites":["example.com"],
+ "done":13, "seen":[...], "queue":[{"url":"…","key":"…","depth":1}, ...]}
+```
+
+- **Atomic write:** temp file → `fsync` → `rename`. A crash leaves the old file or the new one, never half of one.
+- **Consistent:** one `Snapshot()` under the frontier lock. In-flight tasks go first in `queue`, so nothing being worked on is lost.
+- **When:** every 10s, and when the crawl stops. Deleted when the crawl runs out of work. Kept if it stopped at the page limit, so `-resume -pages 500` can extend it.
+- **Safety:** wrong version or a different seed → error, not a silent mix-up.
+
+**Guarantee:** at-least-once. A page interrupted halfway is done again on resume; `OnDocument` may see it twice, and the DocStore dedupes by ID.
 
 ---
 
@@ -499,80 +504,59 @@ This is a heuristic, like a very simple version of Mozilla Readability. It also 
 
 ### 7.1 Who shares what
 
-| Shared thing | Used by | Protected by |
-|---|---|---|
-| `tasks` channel | All workers | The channel itself |
-| Tasks in flight | All workers | `sync.WaitGroup` |
-| `VisitedStore` | All workers | `sync.RWMutex` |
-| `RateLimiter` | All workers | `sync.Mutex` |
-| `CrawlStats` | All workers | `sync.Mutex` (atomics would also work) |
-| `DocStore` | All workers | `sync.Mutex` |
-| `OnDocument` callback | All workers | **The caller's job** |
+| Shared thing | Protected by |
+|---|---|
+| Queue, seen set, page budget, in-flight set | Frontier: one `sync.Mutex` + `sync.Cond` |
+| Allowed sites | `sync.RWMutex` (read on every link, written once) |
+| Rate-limit slots | `sync.Mutex` |
+| robots.txt cache | `sync.Mutex` + a `ready` channel per site |
+| Stats counters | `sync.Mutex` |
+| DocStore | `sync.Mutex` |
+| Cancellation | `context.Context` |
+| `OnDocument` callback | The caller |
 
 ### 7.2 How does it know when to stop?
 
-This is the most likely deep question. Workers both consume and produce work, so you can't just "close the channel when the producer finishes". Every worker is a producer.
-
-The solution is to **count tasks**:
+Workers both consume and produce work, so "the producer is done" never happens by itself. The frontier tracks **in-flight** tasks:
 
 ```
-wg.Add(1)   before a task is put in the channel
-wg.Done()   after a task is fully processed (by defer)
-Counter 0   means nothing is queued and nothing is running
-            → nobody can create new work
-            → it's safe to close the channel
+queue empty AND inFlight == 0   → nobody can create new work → over
+done == maxPages                 → over
+Close() (Ctrl-C, Stop)           → over; in-flight tasks requeue themselves
 ```
 
-**Why must `Add` come before the send?** If it came after, this could happen: the worker gets the task and finishes it, the counter hits 0, the channel gets closed, and another worker's send panics with `send on closed channel`.
+Every one of these is checked under the same lock as `Push` and `Done`, so there's no window where a link is being pushed while the frontier decides it's empty.
 
-**Why is it safe to `Add` while `Wait` is running?** A worker calling `Add(1)` is itself processing a task, and that task's `Done` hasn't run yet. So the counter is at least 1, and it can't reach 0 at that moment.
+**First version, for comparison:** a buffered channel plus a `WaitGroup` counting tasks (`Add` before send, `Done` after processing, close at zero). Correct for stopping, but a channel has a fixed size, so it either blocks (deadlock: all workers sending, nobody receiving; I tested it and it hung) or drops links (bug 4). The frontier removes both.
 
-**Why can't a send hit a closed channel?** Every sender is inside a task, and that task holds the counter above 0. The channel only closes at 0. So all senders have already finished.
+### 7.3 Data race vs logic race (strong interview point)
 
-**Bonus point:** `OnPageFetched` runs before `wg.Done()`. So once `Run` returns, every callback has finished. That's what makes `store.Close()` and go-search's `close(docCh)` safe.
+`go test -race` passed on the **buggy** first version. Bugs 2 and 3 below were concurrency bugs anyway.
 
-### 7.3 Why the non-blocking send matters: deadlock
-
-Suppose the send was just `tasks <- newTask`, and one worker finds more links than the channel can hold:
-
-```
-Worker fills the channel, then blocks trying to send one more.
-The only one who could empty the channel is a worker.
-All workers are stuck sending. Nobody is receiving. Forever.
-```
-
-**Measured:** I replaced the `select` with a plain send, on a scratch copy, with 1 worker, `MaxPages=5`, and 20 links on the page. The crawl hung and never finished.
-
-The code comment says the buffer "prevents deadlocks". That's only half true. A buffer alone just delays the problem. The `select` with `default` is what prevents it. The cost is that links get dropped ([bug 4](#bug-4-a-full-queue-silently-drops-links)).
-
-### 7.4 Data race vs logic race (a strong interview point)
-
-`go test -race` passes on this code, yet bugs 2 and 3 below are concurrency bugs. **Measured: the race detector stayed silent while both bugs happened.**
-
-- A **data race** is two goroutines touching the same memory, with at least one writing, and no synchronization. The race detector catches this.
-- A **logic race** (check-then-act) is where every individual access is locked properly, but the sequence isn't atomic. The race detector can't see this.
+- **Data race:** two goroutines touch the same memory, one writing, no synchronization. The race detector catches it.
+- **Logic race (check-then-act):** every access is locked, but the *sequence* isn't atomic:
 
 ```go
-if c.stats.GetCrawledCount() >= c.config.MaxPages { return }  // locked ✓
-// ...fetch page, takes 100ms...
-c.stats.IncrementCrawled()                                    // locked ✓
-// But the gap between them isn't protected.
+if stats.GetCrawledCount() >= max { return }  // locked ✓
+fetch page (100ms)                            // ← every worker passes the check here
+stats.IncrementCrawled()                      // locked ✓
 ```
 
-`MarkVisited` is the right example of the fix: check and write under one lock.
+**Fix pattern:** make check + act one step under one lock. That's `frontier.Next` (check budget + reserve slot), `frontier.Push` (check seen + mark), and `RateLimiter` (check slot + reserve next).
+
+### 7.4 Cancellation path
+
+```
+Ctrl-C → signal.NotifyContext cancels ctx
+       → context.AfterFunc closes the frontier → idle workers' Next() returns false
+       → busy workers: rate-limit wait / retry sleep / HTTP request return ctx.Err()
+       → processTask returns requeue → task goes back in the queue
+       → wg.Wait() returns → final checkpoint saved → DocStore flushed + fsynced
+```
 
 ### 7.5 Is it really BFS?
 
-With 1 worker, yes, it's exact. With many workers it's **approximately** BFS: tasks *start* in FIFO order, but finish in any order. A slow page at depth 1 can finish after pages at depth 2 have begun.
-
-| | BFS (this project) | DFS |
-|---|---|---|
-| Data structure | Queue | Stack / recursion |
-| Finds | Pages near the homepage first, usually the important ones | Goes deep down one path |
-| With a page limit | Gives a broad sample of the site | Can burn the budget in one corner |
-| Spider traps (`/cal/2026/1/2/...`) | Depth limit stops it early | Falls right in |
-
-Complexity: O(V + E) for pages and links, with O(1) visited lookups. The visited set takes O(V) memory.
+With 1 worker, exactly. With many, **approximately**: tasks *start* in FIFO order but finish in any order, so a URL could first be found via a slightly longer path. Fine for a crawler; exact BFS would need a barrier per level (all of depth d before d+1), which leaves workers idle waiting on the slowest page of each level.
 
 ---
 
@@ -587,365 +571,269 @@ go vet ./...           # clean
 
 | Package | Test functions | Coverage |
 |---|---|---|
-| `crawler` | 12 | 78.9% |
-| `extractor` | 16 | 95.7% |
-| `docstore` | 6 | 80.0% |
-| `fetcher` | 5 | 89.5% |
-| `parser` | 5 | 84.4% |
-| `urlutil` | 4 (many table subtests) | 85.4% |
-| `crawl`, `config`, `main` | **0** | **0%** |
+| `crawler` | 32 | 86.3% |
+| `extractor` | 20 | 93.7% |
+| `fetcher` | 10 | 83.3% |
+| `docstore` | 9 | 79.0% |
+| `robots` | 9 | 89.2% |
+| `parser` | 8 | 89.1% |
+| `crawl` | 7 | 92.2% (was 0%) |
+| `urlutil` | 7 (many table subtests) | 85.9% |
 
-**Techniques to mention:** table-driven tests for URL rules, `httptest` fake servers so no real network is needed, and 100 goroutines hitting the visited store at once under `-race`.
+**Techniques:** `httptest` servers that record every request with a timestamp (so tests assert what the *server* saw), table-driven tests for URL and robots rules, `t.TempDir()` for files, and contexts with short timeouts for cancel tests.
 
-### Why the tests missed the bugs
+**The lesson from the bugs:** the old tests passed because they used **one worker** "for deterministic behavior", and tested the engine but not the public API. The new tests deliberately run **5, 10 and 20 workers** and check limits from the server's side:
 
-This is honest and impressive to say out loud:
-
-| Bug | Why tests passed |
+| Test | Asserts |
 |---|---|
-| `-depth 0` ignored | The depth test calls `Crawler` directly. The bug is in `crawl.Run`, which has zero tests. |
-| Page limit overshoot | `TestCrawlerPageLimit` uses `Workers: 1` "for deterministic behavior", the only setting that hides it. |
-| Rate limiter burst | `TestRateLimiterDelay` calls `Wait` one at a time, never concurrently. |
-
-**The lesson:** a deterministic test of a concurrent system can hide exactly the bugs you care about. The tests I'd add: run the crawl with 10+ workers and assert the page limit and the request rate as seen by the server.
+| `TestCrawlerPageLimitManyWorkers` | 20 workers, limit 10 → server sees exactly 10 page requests |
+| `TestCrawlerRateLimitManyWorkers` | 10 workers → every gap between server hits ≥ delay |
+| `TestRateLimiterNoBurst` | 8 goroutines released one delay apart |
+| `TestFrontierConcurrentPush` | 100 goroutines, same 10 URLs → queued exactly 10 |
+| `TestCrawlerDeadLinksDontStarveCrawl` | 10 dead links can't stop the crawl reaching 10 pages |
+| `TestCrawlerInterruptAndResume` | cancel mid-crawl, resume → every page crawled |
+| `TestRunDepthZeroMeansSeedOnly` | through the public API, not the engine |
 
 ---
 
-## 9. Known bugs and limitations
+## 9. Bugs I found and fixed
 
-Every bug here was reproduced by running the code. Know this section best. It's what turns "I wrote it" into "I own it".
+How I found them: ran the code against local test servers with many workers, and counted what the **server** received, instead of trusting the crawler's own counters.
 
-### Bug 1: Zero values are replaced by defaults
+### The six main bugs
 
-[crawl/crawl.go:153](../crawl/crawl.go#L153) and [line 165](../crawl/crawl.go#L165):
+| # | Bug | Cause | Before (measured) | Fix | After (measured) |
+|---|---|---|---|---|---|
+| 1 | `-depth 0`, `-delay 0s` ignored | Go zero value: "unset" and "0" look the same | depth 0 crawled 3 pages | `MaxDepth` literal, `DefaultConfig()`, `NoDelay`/`NoRetries` | 1 page; no-delay crawl instant |
+| 2 | Rate limiter bursts | Timestamp updated *after* sleeping | 10 workers: **94 req/s** vs limit of 10 | Reserve the slot under the lock, then sleep | **10.9 req/s** for 1, 3, 5, 10 workers |
+| 3 | Page limit overshoots | Check-then-act across a 100ms fetch | limit 10 → 14 / 19 / 29 pages with 5 / 10 / 20 workers | Frontier reserves a slot before fetch | exactly 10 every time |
+| 4 | Full queue drops links | Fixed-size channel + non-blocking send; duplicates took slots | 10 dead links → **1 page** crawled, 90 good ones dropped | Unbounded frontier; mark seen on enqueue; failures free their slot | 10 pages crawled |
+| 5 | Redirects not tracked | Final URL ignored | redirect to another site was crawled and saved under the wrong URL | `AllowRedirect` hook; use `resp.Request.URL` | off-site redirect refused; seed redirect followed correctly |
+| 6 | `/blog/` broke relative links | Normalized URL used as the base for links | `post-1` → `/post-1` (404) | Separate fetch URL (as written) from dedupe key; resolve against final URL | `/blog/post-1` fetched |
 
-```go
-if cfg.MaxDepth == 0 && cfg.SeedURL != "" { cfg.MaxDepth = 2 }
-if cfg.CrawlDelay == 0 { cfg.CrawlDelay = 1 * time.Second }
+**The rate-limiter fix in one picture:**
+
+```
+Before:  t=0 A goes, last=0 │ B: wait 200ms │ C: wait 199ms │ D: wait 198ms → B, C, D fire together
+After:   A slot 0 │ B slot 200ms │ C slot 400ms │ D slot 600ms → evenly spaced
+Measured release times (8 goroutines, 200ms):
+         before 0 200 200 200 200 200 200 200     after 0 200 400 600 800 1000 1200 1400
 ```
 
-In Go, an unset `int` is `0`, so the code can't tell "not set" from "the user said 0".
+### Smaller bugs fixed
 
-| Command | Expected | Measured |
+| Bug | Before | After |
 |---|---|---|
-| Depth 0 through `crawl.Run` | 1 page | **3 pages** (`/`, `/d1`, `/d2`) |
-| Depth 0 through `Crawler` directly | 1 page | 1 page |
-| Delay 0, 5 pages, through `crawl.Run` | Instant | **4 seconds** |
+| Pages over 10 MB | silently cut to 10,485,760 bytes | `ErrTooLarge` |
+| Words glued | `foo<br>bar` → `foobar` | `foo bar` |
+| Whole-page `<form>`, loose `<div>` text | lost | kept |
+| Dedupe only within one run | same crawl twice → 4 lines | 2 lines, `Already in File: 2` |
+| `DocumentsSkipped` | always 0 | real count |
+| Validation | `HTTP://x.com` rejected, `http://` accepted | the reverse |
+| Page parsed twice | parser + extractor each parsed | parsed once, tree shared |
+| Same URL rules written twice | `urlutil` and `extractor` | one implementation |
+| Library printed to stdout | always | `Logger` option; report printed by the CLI |
+| Images and PDFs counted as errors | `Errors` | `Skipped` |
+| Panic in callback | crashed the program | recovered, counted, crawl continues |
+| Disk full | logged per page, every page lost | crawl stops with the error |
+| `www.` vs bare host, `:80`, `?utm_*`, param order | different pages / sites | same |
 
-**Fix:** a `crawl.DefaultConfig()` constructor, so 0 keeps its real meaning. Or pointer fields (`*int`), where `nil` means unset.
+### Features added
 
-### Bug 2: The rate limiter bursts with more than one worker
-
-[crawler/ratelimiter.go:46-66](../crawler/ratelimiter.go#L46-L66). The timestamp is only updated *after* waking up:
-
-```
-t=0ms   Worker A: first visit, sets last=0, goes ahead
-t=1ms   Worker B: elapsed 1ms → sleep 199ms (last is NOT updated)
-t=2ms   Worker C: elapsed 2ms → sleep 198ms (last is NOT updated)
-t=3ms   Worker D: same...
-t=200ms B, C, D all wake and fire TOGETHER
-```
-
-**Measured**, 8 goroutines with a 200ms delay. Should be evenly spaced:
-
-```
-Actual:  0  200 200 200 200 200 200 200 ms
-Fixed:   0  200 400 600 800 1000 1200 1400 ms
-```
-
-**Measured** real crawl with a 100ms delay (limit should be 10 requests/second):
-
-| Workers | Before fix | After fix |
-|---|---|---|
-| 1 | 10.9 req/s | 10.9 req/s |
-| 3 | 31.7 req/s | 10.9 req/s |
-| 5 | 48.6 req/s | 10.9 req/s |
-| 10 | **93.8 req/s** | 10.9 req/s |
-
-**Fix: reserve a time slot under the lock, and then sleep.** Tested on a scratch copy; all existing tests pass with `-race`.
-
-```go
-r.mu.Lock()
-now := time.Now()
-slot := r.lastVisit[domain].Add(r.delay)
-if slot.Before(now) {
-    slot = now
-}
-r.lastVisit[domain] = slot   // the next caller queues behind this slot
-r.mu.Unlock()
-time.Sleep(slot.Sub(now))
-```
-
-**The insight to say out loud:** once the limiter works, more workers no longer speed up a single-site crawl. Throughput is about `min(workers / page latency, 1 / delay)`. With a 1s delay and pages that take 200ms, a second worker adds nothing. Workers would only really pay off if the crawler visited many domains. So the speed-up you see from adding workers today comes from this bug.
-
-### Bug 3: The page limit overshoots
-
-[crawler/worker.go:55](../crawler/worker.go#L55) checks the count, but [line 74](../crawler/worker.go#L74) increments it only after the fetch. All workers can pass the check during that gap. It's check-then-act (section 7.4).
-
-**Measured** with `-pages 10`, on a site with 200 pages:
-
-| Workers | Pages actually crawled |
+| Feature | Detail |
 |---|---|
-| 1 | 10 |
-| 5 | 14 |
-| 10 | 19 |
-| 20 | 26–29 |
-
-The worst case is `MaxPages + Workers − 1`.
-
-**Fix: reserve the slot atomically before fetching.** Tested on a scratch copy: exactly 10 pages for every worker count, all tests pass with `-race`.
-
-```go
-func (s *CrawlStats) TryReservePage(max int) bool {
-    s.mu.Lock()
-    defer s.mu.Unlock()
-    if s.reserved >= max { return false }
-    s.reserved++
-    return true
-}
-// Worker calls this before fetching, and gives the slot back if the fetch fails.
-```
-
-### Bug 4: A full queue silently drops links
-
-[crawler/worker.go:113-120](../crawler/worker.go#L113-L120). The queue holds `MaxPages` items. Links that don't fit are thrown away and never retried. Links are also only marked visited when taken from the queue, so the same URL can fill several slots.
-
-**Measured:** a site with 100 links where the first 10 are dead, `-pages 10`, 1 worker:
-
-```
-Crawled: 1     Errors: 10     Skipped: 90     ← 90 good pages never visited
-```
-
-The queue filled with dead links, the good ones were dropped, and the crawl ended far under the limit.
-
-**Fix:** a separate unbounded frontier, such as a slice guarded by a mutex, or one coordinator goroutine that owns the queue and feeds workers. Also mark URLs as seen when *queuing* them, so duplicates never take a slot. *(This is a design idea, not something I've tested.)*
-
-### Bug 5: Redirects are not tracked
-
-`http.Client` follows up to 10 redirects by itself, and the code never asks where it ended up.
-
-**Measured:** seed on server A redirects to server B:
-
-- A page on **another domain got crawled**, bypassing the same-domain rule.
-- It was saved under **A's URL**, though the content is from B.
-- B's relative link `/only-on-b` was resolved against **A**, giving a 404.
-
-**Fix:** use `resp.Request.URL`, which is the final URL. Use it as the base for links, as the document URL, and for the domain check. *(Not tested.)*
-
-### Bug 6: Removing the trailing slash breaks relative links
-
-Seen in the section 5 trace. `/blog/` becomes `/blog`, and then `post-1` resolves to `/post-1` (404) and not `/blog/post-1`. Normalized URLs are fine as *dedupe keys*, but shouldn't also be used as the *base for resolving links*.
-
-**Fix:** keep the original URL for resolving. Using the final URL from bug 5 also solves this for sites that redirect `/blog` to `/blog/`. *(Not tested.)*
-
-### Smaller bugs
-
-| Issue | Evidence | Fix |
-|---|---|---|
-| `CrawlResult.DocumentsSkipped` is always 0 | Never assigned ([crawl.go:137](../crawl/crawl.go#L137)) | Add `DocStore.Skipped()` |
-| Dedupe only lasts for one run | Measured: same crawl twice → file has 2, then 4 lines | Load existing IDs on open |
-| Pages over 10 MB are silently cut | Measured: 11 MB → 10,485,760 bytes, no error. The comment on `FetchPage` claims it returns an error | Read one extra byte to detect it, then return an error or log it |
-| Words stuck together | Measured: `foo<br>bar` → `foobar` | Add a space at element boundaries |
-| Valid URLs rejected, invalid accepted | Measured: `HTTP://x.com` rejected, `http://` accepted | Check the parsed scheme and host |
-| Page parsed twice | `parser` and `extractor` each call `html.Parse` | Parse once, pass the tree |
-| Same normalize logic written twice | `urlutil.NormalizeURL`, `extractor.normalizeForDedup` | Keep one |
-| Library prints to stdout | `printReport` always prints, `log` always writes | Inject a logger |
-| Non-HTML links counted as errors | `logo.png` counted in `Errors` | Separate "skipped" from "failed" |
-
-### Missing features
-
-| Missing | Why it matters | How I'd add it |
-|---|---|---|
-| **robots.txt** | The basic rule of polite crawling; the biggest gap | Fetch per domain, cache it, check before queuing, honor `Crawl-delay` |
-| **Cancellation** | `Run` can't be stopped once started | Pass `context.Context` to `Run` and to `http.NewRequestWithContext` |
-| **Retries** | One network blip loses a page forever | Retry timeouts and 5xx with exponential backoff and jitter; honor 429 `Retry-After` |
-| **Resume** | A crash loses all progress | Save the frontier and visited set to disk or Redis |
-| **Query cleanup** | `?utm_*` makes fake new pages | Remove known tracking parameters, sort the rest |
-| **Content dedupe** | Different URLs can serve the same page | Hash the content; SimHash for near-duplicates |
-| **JavaScript pages** | Single-page apps look empty | Headless browser, used only when needed because it's slow |
-| **SSRF protection** | A crawler that accepts user URLs (go-search's `POST /crawl`) could reach `localhost` or cloud metadata at `169.254.169.254` | Block private IP ranges in a custom `DialContext`, which also catches redirects |
-
-### Repo housekeeping
-
-- `README.md` is out of date. It describes v1: no `-output`, no extractor, no docstore, no `crawl` package.
-- Dead code: the `crawler.CrawlResult` type is never used.
+| **robots.txt** | RFC 9309 rules, cached per site, `Crawl-delay`, checked on links and redirects |
+| **Retries** | timeouts, network errors, 429, 5xx; exponential backoff + jitter; `Retry-After` |
+| **Cancellation** | `RunContext(ctx)`; Ctrl-C in the CLI |
+| **Resume** | atomic checkpoints every 10s and on stop; `-checkpoint` / `-resume` |
+| **`<base href>`** | honored when resolving links |
 
 ---
 
-## 10. How it would scale
+## 10. Limits today, and how it would scale
 
-"Design a crawler for 1 billion pages a month" is a classic question. That's about 400 pages per second, and a single process can't hold the state.
+### 10.1 What it still doesn't do
 
-| Problem today | At scale |
+| Limit | Why it matters | Next step |
+|---|---|---|
+| One site per crawl | Can't crawl the web | Per-host queues; more workers then really help |
+| One process, state in RAM | Seen set ~150 bytes/URL (rough): 1M URLs ≈ 150 MB | Disk-backed store (SQLite / RocksDB) |
+| Checkpoint rewrites the whole state | Fine for thousands–millions of URLs, slow beyond | Append-only log, or a database |
+| No JavaScript | Single-page apps look empty | Headless browser, only when needed |
+| No near-duplicate detection | Same content at many URLs | SimHash on content |
+| robots.txt cached for the crawl | Very long crawls should refresh it | Expire after 24h |
+| 5xx robots.txt blocks the site for the whole crawl | One bad moment stops everything | Retry robots.txt later |
+| SSRF guard lives in go-search, not here | A program accepting user URLs must add one | Optional private-IP blocking dialer |
+
+Measured on a real site: 5 pages of books.toscrape.com with 3 workers in 6.5s (1s delay, robots.txt checked).
+
+### 10.2 Scaling to 10 billion pages
+
+**Math**, assuming 30 days and ~100 KB per page:
+
+| Need | Estimate |
 |---|---|
-| Queue is a Go channel in one process | **URL frontier** in Kafka, Redis, or a database |
-| Visited set is a Go map | **Bloom filter** in front of a key-value store. Roughly 1.2 GB for 1B URLs at 1% false positives. The cost of a false positive is only a skipped page, which is usually acceptable. |
-| Rate limiter is in one process | **Partition by host:** `hash(host) → worker`. All of one site's URLs go to one worker, so politeness stays local and simple. |
-| JSONL file | **Object storage** (S3) for the raw pages, metadata in a database, Kafka to feed the indexer |
-| Fixed page and depth limits | **Prioritization** by page importance and how often it changes |
-| One crawl, then finished | **Recrawl scheduling** so popular pages get refreshed sooner |
+| Throughput | 10B / 2.6M seconds ≈ **3,900 pages/s** |
+| Machines | 40–80 at 50–100 pages/s each (to be measured) |
+| Bandwidth | ≈ 3 Gbps |
+| Raw storage | ≈ **1 PB** before compression |
+| Bloom filter, 10B URLs at 1% false positives | ≈ 12 GB, but 1% = 100M pages wrongly skipped |
 
 ```
-            ┌──────────────┐
-  seeds ──► │   Frontier   │◄───── new links (after dedupe)
-            │ priority +   │                ▲
-            │ per-host     │                │
-            └──────┬───────┘         ┌──────┴───────┐
-                   │ hash(host)      │ Visited +    │
-       ┌───────────┼───────────┐     │ content dedupe│
-       ▼           ▼           ▼     └──────▲───────┘
-    Worker 1    Worker 2    Worker N        │
-       └───────────┬───────────┘            │
-                   ▼                        │
-             Parse + extract ───────────────┘
-                   │
-                   ▼
-         S3 + Kafka → search indexer
+          ┌── Frontier (priority + per-host queues) ◄───┐
+          │                                             │
+    hash(host) → consistent hashing                     │
+          ▼                                             │
+   Fetcher fleet ── robots cache, DNS cache             │
+          │                                             │
+          ▼                                             │
+   S3 (raw pages) ──► Kafka ──► Parser fleet ──► URL-seen store
+                                     │          (Bloom + RocksDB)
+                                     ▼
+                         Content dedupe → Indexer
 ```
 
-**Extra topics to name:** DNS caching (DNS lookups are a hidden bottleneck), spider traps (limit depth per host and watch for repeating URL patterns), crawl budget per domain, and the **Mercator** design, which has "front queues" for priority and "back queues" for per-host politeness.
+| Today | At 10B | Why |
+|---|---|---|
+| In-memory frontier | Durable frontier (Mercator: front queues for priority, back queues per host) | Survives crashes, no RAM limit |
+| `map` seen set | Bloom filter in front of a key-value store | Fast "probably new", exact answer avoids lost pages |
+| Rate limiter in one process | `hash(host)` → one owner | Politeness stays local |
+| Fetch + parse in one worker | Separate fleets joined by Kafka | Network and CPU scale separately |
+| JSONL | S3 in WARC format | Reparse without refetching |
+| Requeue on cancel | Lease + timeout + redelivery | A dead machine's tasks come back |
+| One crawl | Recrawl scheduler | Pages change |
 
-**Start with the smallest next step:** before any of this, I'd fix the single-process bugs, add `context` and robots.txt, and make the crawler work across many domains, which is where more workers actually help.
+**The failure rule is the same idea as my checkpoint:** at-least-once delivery + idempotent writes keyed by URL hash. Doing work twice is harmless; losing it isn't.
+
+**Three hard problems to name:**
+1. **Politeness caps big sites:** 100M pages at 1 request/s takes 3.2 years. You need per-site crawl budgets and priority, not just more machines.
+2. **Bad content:** spider traps and near-duplicates waste the budget. Per-host limits, SimHash.
+3. **DNS:** a hidden bottleneck at this scale. Local caching resolvers.
 
 ---
 
 ## 11. Interview Q&A
 
-Answer out loud first, and then read.
+Answer out loud first, then read.
 
 ### Design
 
 **Q: Why a worker pool and not one goroutine per URL?**
-Goroutines are cheap, but what they do isn't. One per URL on a big site means thousands of open connections and pages in memory at once. N workers puts a hard cap on it.
+Goroutines are cheap, but what they do isn't: one per URL means thousands of open connections and pages in memory. N workers is a hard cap.
 
-**Q: Why a channel, and not a slice with a mutex?**
-A channel is a thread-safe FIFO that also makes idle workers wait with no busy looping, and `close` gives a clean shutdown signal. Its weakness is a fixed capacity, which causes bug 4. A slice would fix that but needs more code.
+**Q: Why a mutex + `sync.Cond` frontier, and not a channel?**
+A channel has a fixed size. Full, it either blocks the sender (deadlock, since workers are also the only receivers; I tested it and it hung) or forces you to drop links. The frontier never blocks on push, and one lock covers queue, seen set and budget, so all the check-then-act steps are atomic and snapshots are consistent.
 
-**Q: Why a callback, and not returning all the documents at the end?**
-Streaming. A big crawl would hold every document in memory until the end, and the caller couldn't see partial results. It also keeps the crawler independent from extraction and indexing.
+**Q: Why keep the fetch URL and the dedupe key separate?**
+The key is aggressive (no trailing slash, sorted query) so duplicates merge. But the page must be fetched as written, because its relative links resolve against its real URL. Using the key as the base was bug 6.
 
-**Q: Why normalize URLs?**
-So one page has exactly one identity. Otherwise dedupe fails and the same page gets crawled many times.
-
-**Q: Why stay on one domain?**
-To keep the crawl focused and bounded. Without it, a few hops lead to the entire internet. It's also strict: `www.example.com` counts as a different domain to `example.com`.
+**Q: Why a callback, not a returned slice?**
+Streaming: a big crawl would hold every document in memory, and the caller couldn't start indexing early.
 
 **Q: Why BFS?**
-Important pages are usually close to the homepage, so a page limit gets a useful sample. The depth limit also protects from infinite URL spaces.
+Important pages are usually near the homepage, so a page limit gives a broad, useful sample, and the depth limit stops spider traps early.
 
 ### Concurrency
 
 **Q: How do you know the crawl is finished?**
-Count tasks with a WaitGroup: `Add` before queuing, `Done` after processing. At zero, nothing is queued or running, so no new work can appear. Then close the channel and the workers exit. (Section 7.2.)
+The frontier ends it when the queue is empty and nothing is in flight, the page limit is reached, or it's closed. Checked under the same lock as `Push` and `Done`.
 
-**Q: What if two workers find the same URL at the same time?**
-Both can queue it, since `IsVisited` is only a pre-check. But `MarkVisited` is atomic, so only one worker gets `true` and fetches it. The other skips.
+**Q: Two workers find the same URL at once?**
+`Push` checks and marks `seen` under one lock. Exactly one succeeds.
 
-**Q: Why `RWMutex` for visited, but `Mutex` for the limiter?**
-The visited store has read-only methods (`IsVisited`, `Count`) that can run in parallel. The limiter's `Wait` always writes. To be honest, the gain from `RWMutex` is small here since every task calls the write path too.
+**Q: How is the page limit exact with 20 workers?**
+`Next` reserves the slot before the fetch: it only hands out work while `done + inFlight < max`. A failure gives the slot back.
 
-**Q: Why not `sync.Map`?**
-It would work: `LoadOrStore` gives the same atomic check. But `sync.Map` is built for keys that rarely change, and a crawler keeps adding new ones. A plain map with a mutex is simpler and clearer.
-
-**Q: Could this deadlock?**
-Not as written, because the send is non-blocking. With a plain blocking send, yes. I tested it, and it hangs. (Section 7.3.)
+**Q: Why did the old rate limiter burst?**
+It recorded "last request time" after sleeping, so several workers read the same old time and woke together. Now each takes the next slot under the lock before sleeping.
 
 **Q: Does `-race` passing mean it's correct?**
-No. It finds data races, not logic races. Bugs 2 and 3 pass `-race`. (Section 7.4.)
+No: it catches data races, not logic races. My first version passed `-race` with two concurrency bugs.
 
-**Q: Does the rate limiter hold the lock while sleeping?**
-No, it unlocks first, or every other domain would wait too. The bug is that it doesn't reserve a time slot before unlocking.
+**Q: Why `Wait` in a `for` loop?**
+A wake-up only means "something changed". Another worker may have taken the task first, so re-check the condition.
 
-**Q: What happens if `OnDocument` panics?**
-There's no `recover`, so the whole program crashes. If it's slow, it only holds that one worker, which is useful backpressure.
+**Q: What if `OnDocument` panics?**
+Recovered in `processTask`: logged with a stack trace, counted as an error, the crawl continues.
 
-### Failure and behavior
+### Failure
 
 **Q: What happens when a fetch fails?**
-Logged, error counter goes up, and the task ends. No retry. The URL stays marked visited, so it won't be tried again in this run.
+Timeouts, network errors, 429 and 5xx are retried (2 by default) with exponential backoff, jitter and `Retry-After`, each through the rate limiter. 404, non-HTML, too large: not retried. A failed page frees its budget slot.
 
-**Q: What if a site never responds?**
-`Client.Timeout` ends the request, including slow body reads. One worker waits at most that long.
+**Q: What happens on Ctrl-C?**
+The context is cancelled: idle workers exit, busy ones abort their wait or request and requeue the task, the checkpoint is saved, and the output file is flushed and fsynced. `-resume` continues.
 
-**Q: What if a page is huge?**
-`LimitReader` stops at 10 MB. It's silently cut off, and the partial HTML is still parsed.
+**Q: What if the process is killed (`kill -9`) or the machine dies?**
+By design you lose at most ~10s: the last periodic checkpoint is intact thanks to temp file + rename. Pages done after it are fetched again on resume; the DocStore skips their documents by ID. (Tested: Ctrl-C and resume. Not tested: an actual `kill -9` mid-write.)
 
-**Q: What if the process crashes mid-crawl?**
-Documents already saved stay in the file, because of the flush after every write. The visited set and queue are lost, so a restart begins from scratch and appends duplicates.
+**Q: Why temp file + rename?**
+Rename is atomic on POSIX. Writing in place could leave half a file if the crash comes mid-write. `fsync` before rename makes sure the data is on disk before the name points to it.
 
-**Q: What is a spider trap, and are you safe?**
-A site that generates endless URLs, like a calendar with a "next month" link forever. The depth and page limits bound the damage, so it can't run forever, but it can waste the entire page budget.
+**Q: What if the disk fills up?**
+`Save` fails → `Stop(err)` → crawl stops, returns the error, and the page is requeued so a resume redoes it.
 
-**Q: Is your crawler polite?**
-Partly. It has a delay per domain and a clear User-Agent. But it ignores robots.txt, and the delay has bug 2. I'd fix both before crawling any site I don't own.
+**Q: Do you obey robots.txt?**
+Yes, RFC 9309: longest match, Allow wins ties, `*` and `$`, our group or `*`. 404 means allow all; 5xx or unreachable means disallow all. Plus `Crawl-delay`, and checked on redirects too.
 
 ### Go-specific
 
-**Q: Why `defer wg.Done()`?**
-`processTask` has many return paths. Missing one `Done` means `Wait` never returns and the crawl hangs. `defer` guarantees it. It also runs if the function panics.
+**Q: What's the zero-value problem and how did you solve it?**
+`MaxDepth: 0` and "not set" look the same in Go. `MaxDepth` is now literal, `DefaultConfig()` gives defaults, and for safety settings I used "0 = safe default, sentinel = off" (`NoDelay`), so forgetting a field never makes the crawler impolite.
 
-**Q: Why does `Add` go before the send?**
-Otherwise the counter could hit zero while there's still work, closing the channel under another worker. (Section 7.2.)
+**Q: What does `context.AfterFunc` do here?**
+Runs `frontier.Close` when the context is cancelled, waking workers blocked on the `Cond`. A `Cond` can't wait on a channel, so this bridges the two.
 
-**Q: What is the zero-value problem?**
-Go gives unset fields their zero value, so `MaxDepth: 0` looks the same as not setting it. That's bug 1. Fix it with a constructor, pointers, or the functional options pattern.
-
-**Q: What's the size of the channel buffer in memory?**
-Each `CrawlTask` is 24 bytes (16 for the string header, 8 for the int), allocated up front. So 1M capacity is about 24 MB, plus the URL strings it points to.
-
-**Q: Do you need to close the response body?**
-Yes, always. Otherwise the connection can't be reused and it leaks. Here it's `defer resp.Body.Close()`.
+**Q: Why parse once?**
+`html.Parse` is the most expensive CPU step. The tree is shared by the link parser and the extractor, so it's done once per page instead of twice.
 
 ### Practice: "how would you change it?"
 
-Good to walk through in code, as these are common live follow-ups:
-
-1. **Add `context.Context`.** Where do you check it? In the worker loop, and pass it to the HTTP request.
-2. **Add robots.txt.** Where does the cache go, and how do you stop two workers fetching it at once? (`sync.Once` per domain, or `singleflight`.)
-3. **Add retries.** Which errors should retry? How do you keep them from breaking the rate limit?
-4. **Allow many domains.** What changes in `IsSameDomain`? Do workers get blocked sleeping for one slow domain? (Yes, so you'd need per-domain queues.)
-5. **Make it resumable.** What must be saved, and when?
+1. **Many domains at once.** Per-host queues so a slow site doesn't block workers sleeping on its rate limit.
+2. **Exact BFS depth.** Level-by-level barrier, or keep the minimum depth per URL. What does it cost?
+3. **Disk-backed frontier.** What goes in SQLite, and how do you claim a task safely? (A transaction that flips `pending` → `in_progress`.)
+4. **Refresh robots.txt.** Where would the 24h expiry go?
+5. **Near-duplicate pages.** Where would SimHash go: before `OnDocument`, or in the indexer?
 
 ---
 
 ## 12. Cheat sheet
 
-**In one line:** worker pool + channel queue + visited set + rate limiter → fetch, parse, extract → stream to callback or JSONL.
+**In one line:** worker pool + frontier (one lock + Cond) + slot rate limiter + robots.txt → fetch with retries, parse once, extract → stream to callback or JSONL, with atomic checkpoints.
 
 **Worker flow:**
 ```
-limits → MarkVisited → rate wait → fetch → links → callback → queue new links → wg.Done
+Next() (reserves slot) → rate slot → fetch (+retry) → parse once → links → OnPage → Push new links → Done(outcome)
 ```
 
-**Stopping:** WaitGroup counts tasks. `Add` before send, `Done` after processing, close at zero.
+**Stopping:** queue empty AND nothing in flight, OR page limit, OR Close. Cancel → requeue in-flight → save checkpoint.
 
-**Five decisions to defend:**
+**Six decisions to defend:**
 
 | Decision | Reason | Cost |
 |---|---|---|
 | Fixed worker pool | Bounded resources | Tune N by hand |
-| Non-blocking send | No deadlock | Drops links when full |
-| Atomic `MarkVisited` | Exactly one worker fetches | Memory grows with URLs |
-| Callback output | Streaming, decoupled | Caller must be thread-safe |
-| JSONL + flush each write | Survives a program crash | Slower, not fsync-safe |
+| One-lock frontier + Cond | Atomic dedupe + budget, no deadlock, consistent snapshot | One lock is a bottleneck at huge scale |
+| Reserve before act (pages, rate slots) | No logic races | Slight under-use if a reserved fetch fails |
+| Fetch URL ≠ dedupe key | Relative links stay right | Two strings per task |
+| Safe zero values (`NoDelay`) | Forgetting a field never hurts a site | Slightly unusual API |
+| Temp file + fsync + rename | Crash-safe checkpoint | Whole state rewritten every 10s |
 
-**Six bugs to know cold:**
+**Six bugs, before → after:**
 
-| # | Bug | One-line cause | One-line fix |
+| # | Bug | Before | After |
 |---|---|---|---|
-| 1 | `-depth 0`, `-delay 0` ignored | Can't tell 0 from unset | `DefaultConfig()` or pointers |
-| 2 | Rate limit bursts: 94 req/s vs limit of 10 | Timestamp set after sleep | Reserve the slot under the lock |
-| 3 | 10-page limit crawls 19 | Check-then-act | Atomic reservation |
-| 4 | Full queue drops links | Fixed capacity | Unbounded frontier, mark on enqueue |
-| 5 | Redirects leave the domain | Final URL ignored | Use `resp.Request.URL` |
-| 6 | `/blog/` breaks relative links | Normalized URL used as base | Resolve with the original URL |
-
-**Top missing feature:** robots.txt. Then `context` cancellation, then retries.
+| 1 | depth 0 ignored | 3 pages | 1 |
+| 2 | rate burst | 94 req/s | 10.9 req/s |
+| 3 | page overshoot | 29 of 10 | 10 of 10 |
+| 4 | dropped links | 1 page | 10 pages |
+| 5 | redirects | off-site crawled | refused |
+| 6 | `/blog/` relative links | 404 | correct |
 
 **Golden lines:**
 
-- "A WaitGroup counts tasks here, not workers."
-- "The race detector finds data races, not logic races."
-- "A deterministic test can hide the concurrency bug you care about. My page limit test used one worker."
-- "Once the limiter is right, more workers don't speed up a single site. Throughput is capped at one over the delay."
-- "For scale, I'd partition by host hash, so politeness stays local to a worker."
+- "The race detector finds data races, not logic races. Both my worst bugs passed `-race`."
+- "Reserve before you act: page slots, rate-limit slots, seen keys."
+- "I test concurrency with many workers and count what the server saw."
+- "Once the limiter is right, more workers don't speed up one site: throughput is capped at one over the delay."
+- "Checkpoints are at-least-once plus idempotent writes; the same rule a 10-billion-page crawler uses."

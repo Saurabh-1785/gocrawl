@@ -207,3 +207,51 @@ func TestIsValidURL(t *testing.T) {
 		})
 	}
 }
+
+// TestNormalizeURLDedupeRules covers the rules added so the same page
+// isn't crawled under several URLs.
+func TestNormalizeURLDedupeRules(t *testing.T) {
+	tests := []struct{ input, expected string }{
+		{"http://example.com:80/a", "http://example.com/a"},              // default port
+		{"https://example.com:443/a", "https://example.com/a"},           // default port
+		{"http://example.com:8080/a", "http://example.com:8080/a"},       // other port kept
+		{"http://example.com/a?b=2&a=1", "http://example.com/a?a=1&b=2"}, // sorted query
+		{"http://example.com/a?utm_source=x&id=5&fbclid=y", "http://example.com/a?id=5"},
+		{"http://example.com/a?", "http://example.com/a"},
+		{"http://example.com/a/?x=1", "http://example.com/a?x=1"}, // slash removed even with a query
+		{"http://example.com/blog/INDEX.HTML", "http://example.com/blog"},
+	}
+	for _, tt := range tests {
+		got, err := NormalizeURL(tt.input)
+		if err != nil || got != tt.expected {
+			t.Errorf("NormalizeURL(%q) = %q, %v; want %q", tt.input, got, err, tt.expected)
+		}
+	}
+}
+
+func TestIsSameDomainWWWAndScheme(t *testing.T) {
+	tests := []struct {
+		seed, check string
+		want        bool
+	}{
+		{"http://example.com/", "http://www.example.com/a", true},
+		{"https://www.example.com/", "http://example.com/a", true},
+		{"https://example.com/", "https://example.com:443/a", true},
+		{"http://example.com/", "http://example.com:8080/a", false},
+		{"http://example.com/", "http://blog.example.com/a", false},
+	}
+	for _, tt := range tests {
+		if got := IsSameDomain(tt.seed, tt.check); got != tt.want {
+			t.Errorf("IsSameDomain(%q, %q) = %v, want %v", tt.seed, tt.check, got, tt.want)
+		}
+	}
+}
+
+func TestIsValidURLNeedsHost(t *testing.T) {
+	if IsValidURL("http://") {
+		t.Error(`"http://" has no host and should be invalid`)
+	}
+	if !IsValidURL("HTTP://example.com") {
+		t.Error("uppercase scheme should be valid")
+	}
+}

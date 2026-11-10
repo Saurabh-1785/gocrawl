@@ -1,7 +1,10 @@
 package parser
 
 import (
+	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 // TestExtractLinks tests that we correctly find links in HTML.
@@ -138,5 +141,31 @@ func TestExtractLinksWithFragments(t *testing.T) {
 	// Both links point to /page (fragments removed), so we should get just 1
 	if len(links) != 1 {
 		t.Errorf("Expected 1 unique link (fragments stripped), got %d: %v", len(links), links)
+	}
+}
+
+// Links keeps URLs as written (trailing slash included), so the crawler
+// fetches what the author linked and relative links resolve correctly.
+func TestLinksKeepsURLAsWritten(t *testing.T) {
+	root, _ := html.Parse(strings.NewReader(`<a href="/blog/">Blog</a><a href="/blog">dup</a><a href="#top">top</a>`))
+	links := Links(root, "http://example.com/")
+	if len(links) != 1 || links[0] != "http://example.com/blog/" {
+		t.Errorf("Links = %v, want [http://example.com/blog/]", links)
+	}
+}
+
+func TestLinksResolveAgainstPageWithTrailingSlash(t *testing.T) {
+	root, _ := html.Parse(strings.NewReader(`<a href="post-1">Post</a>`))
+	links := Links(root, "http://example.com/blog/")
+	if len(links) != 1 || links[0] != "http://example.com/blog/post-1" {
+		t.Errorf("Links = %v, want [http://example.com/blog/post-1]", links)
+	}
+}
+
+func TestLinksHonorsBaseTag(t *testing.T) {
+	root, _ := html.Parse(strings.NewReader(`<html><head><base href="/docs/"></head><body><a href="intro">Intro</a></body></html>`))
+	links := Links(root, "http://example.com/page")
+	if len(links) != 1 || links[0] != "http://example.com/docs/intro" {
+		t.Errorf("Links = %v, want [http://example.com/docs/intro]", links)
 	}
 }

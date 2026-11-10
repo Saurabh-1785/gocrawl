@@ -1,96 +1,139 @@
 package parser
 
 import (
+	"net/url"
 	"strings"
 
 	"github.com/Saurabh-1785/gocrawl/urlutil"
 	"golang.org/x/net/html"
 )
 
-// ExtractLinks parses an HTML page and returns all the URLs it links to.
+// Links returns every crawlable link on an already-parsed page.
 //
-// How it works:
-//  1. Parse the HTML into a tree of nodes
-//  2. Walk through every node in the tree
-//  3. When we find an <a> tag, grab its "href" attribute
-//  4. Convert relative URLs to absolute (e.g., "/about" -> "http://example.com/about")
-//  5. Normalize each URL for consistent comparison
-//  6. Filter out non-http/https links (javascript:, mailto:, etc.)
-//  7. Remove duplicates within this page
-//  8. Return the clean list
-func ExtractLinks(body string, baseURL string) []string {
-	// Parse the HTML string into a node tree
-	doc, err := html.Parse(strings.NewReader(body))
-	if err != nil {
-		return nil // If we can't parse the HTML, return no links
+// Each link is an absolute http(s) URL with the fragment removed, but
+// otherwise exactly as the page author wrote it (for example "/blog/" keeps
+// its trailing slash). That matters: the crawler fetches this URL, and the
+// page it gets back resolves its own relative links against it.
+//
+// Duplicates are removed using the normalized form, so "/about" and
+// "/about#team" count once. pageURL should be the final URL of the page
+// (after redirects). A <base href> tag on the page overrides it.
+//
+// The tree is walked depth-first (recursion), visiting every node once.
+func Links(root *html.Node, pageURL string) []string {
+	if root == nil {
+		return nil
 	}
+	base := baseURL(root, pageURL)
 
-	// seen keeps track of URLs we've already found on THIS page
-	// so we don't return duplicates
 	seen := make(map[string]bool)
 	var links []string
 
-	// walkNode recursively visits every node in the HTML tree.
-	// We define it as a variable so it can call itself (recursion).
-	var walkNode func(node *html.Node)
-	walkNode = func(node *html.Node) {
-		// Check if this node is an <a> (anchor) element
-		if node.Type == html.ElementNode && node.Data == "a" {
-			// Look through the tag's attributes for "href"
-			for _, attr := range node.Attr {
-				if attr.Key == "href" {
-					link := strings.TrimSpace(attr.Val)
-
-					// Skip empty links
-					if link == "" {
-						continue
-					}
-
-					// Skip javascript:, mailto:, tel:, and # links
-					lowerLink := strings.ToLower(link)
-					if strings.HasPrefix(lowerLink, "javascript:") ||
-						strings.HasPrefix(lowerLink, "mailto:") ||
-						strings.HasPrefix(lowerLink, "tel:") ||
-						link == "#" {
-						continue
-					}
-
-					// Convert relative URL to absolute
-					absoluteURL, err := urlutil.ResolveURL(baseURL, link)
-					if err != nil {
-						continue // Skip URLs we can't resolve
-					}
-
-					// Normalize the URL (lowercase, remove fragment, etc.)
-					normalizedURL, err := urlutil.NormalizeURL(absoluteURL)
-					if err != nil {
-						continue // Skip URLs we can't normalize
-					}
-
-					// Check if it's a valid http/https URL
-					if !urlutil.IsValidURL(normalizedURL) {
-						continue
-					}
-
-					// Only add if we haven't seen this URL on this page yet
-					if !seen[normalizedURL] {
-						seen[normalizedURL] = true
-						links = append(links, normalizedURL)
-					}
-
-					break // Found href, no need to check other attributes
+	var walk func(n *html.Node)
+	walk = func(n *html.Node) {
+		if n.Type == html.ElementNode && n.Data == "a" {
+			if href, ok := attr(n, "href"); ok {
+				if link, key, ok := clean(base, href); ok && !seen[key] {
+					seen[key] = true
+					links = append(links, link)
 				}
 			}
 		}
-
-		// Visit all child nodes (recursion)
-		for child := node.FirstChild; child != nil; child = child.NextSibling {
-			walkNode(child)
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			walk(child)
 		}
 	}
-
-	// Start walking from the root of the document
-	walkNode(doc)
-
+	walk(root)
 	return links
+}
+
+// ExtractLinks parses an HTML page and returns its links in normalized form.
+// It is the simple, one-call version of Links, kept for callers that only
+// need dedupe keys.
+func ExtractLinks(body string, baseURL string) []string {
+	root, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		return nil
+	}
+	raw := Links(root, baseURL)
+	links := make([]string, 0, len(raw))
+	for _, link := range raw {
+		if key, err := urlutil.NormalizeURL(link); err == nil {
+			links = append(links, key)
+		}
+	}
+	return links
+}
+
+// clean turns one href into (absolute link, dedupe key).
+// It rejects empty links, "#", javascript:, mailto:, tel:, and non-http(s).
+func clean(base, href string) (link, key string, ok bool) {
+	href = strings.TrimSpace(href)
+	lower := strings.ToLower(href)
+	if href == "" || strings.HasPrefix(href, "#") ||
+		strings.HasPrefix(lower, "javascript:") ||
+		strings.HasPrefix(lower, "mailto:") ||
+		strings.HasPrefix(lower, "tel:") {
+		return "", "", false
+	}
+
+	abs, err := urlutil.ResolveURL(base, href)
+	if err != nil || !urlutil.IsValidURL(abs) {
+		return "", "", false
+	}
+
+	u, err := url.Parse(abs)
+	if err != nil {
+		return "", "", false
+	}
+	u.Fragment = ""
+	u.RawFragment = ""
+	link = u.String()
+
+	key, err = urlutil.NormalizeURL(link)
+	if err != nil {
+		return "", "", false
+	}
+	return link, key, true
+}
+
+// baseURL returns the URL that relative links resolve against:
+// the first <base href>, if present, otherwise the page URL.
+func baseURL(root *html.Node, pageURL string) string {
+	var found string
+	var walk func(n *html.Node) bool
+	walk = func(n *html.Node) bool {
+		if n.Type == html.ElementNode && n.Data == "base" {
+			if href, ok := attr(n, "href"); ok && strings.TrimSpace(href) != "" {
+				found = strings.TrimSpace(href)
+				return true
+			}
+		}
+		if n.Type == html.ElementNode && n.Data == "body" {
+			return false // <base> only belongs in <head>
+		}
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			if walk(c) {
+				return true
+			}
+		}
+		return false
+	}
+	if !walk(root) {
+		return pageURL
+	}
+	if abs, err := urlutil.ResolveURL(pageURL, found); err == nil {
+		return abs
+	}
+	return pageURL
+}
+
+// attr returns the value of an HTML attribute.
+func attr(n *html.Node, key string) (string, bool) {
+	for _, a := range n.Attr {
+		if a.Key == key {
+			return a.Val, true
+		}
+	}
+	return "", false
 }

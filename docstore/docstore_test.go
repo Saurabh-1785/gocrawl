@@ -238,3 +238,72 @@ func TestDocStore_SkipsDuplicateIDs(t *testing.T) {
 		t.Errorf("expected second doc to be 'Second', got '%s'", second.Title)
 	}
 }
+
+// Documents written by an earlier run are not written again.
+func TestDocStore_DedupesAcrossRuns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.jsonl")
+
+	ds1, _ := NewDocStore(path)
+	ds1.Save(extractor.Document{ID: "1"})
+	ds1.Save(extractor.Document{ID: "2"})
+	ds1.Close()
+
+	ds2, err := NewDocStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds2.Save(extractor.Document{ID: "1"}) // already in the file
+	ds2.Save(extractor.Document{ID: "3"})
+	ds2.Close()
+
+	if ds2.Count() != 1 || ds2.Skipped() != 1 {
+		t.Errorf("second run: count=%d skipped=%d, want 1 and 1", ds2.Count(), ds2.Skipped())
+	}
+	data, _ := os.ReadFile(path)
+	if n := len(strings.Split(strings.TrimSpace(string(data)), "\n")); n != 3 {
+		t.Errorf("file has %d lines, want 3", n)
+	}
+}
+
+// A line cut off by a crash is closed off, so the next document starts on
+// its own line and every complete line is still valid JSON.
+func TestDocStore_RepairsCutOffLine(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.jsonl")
+	os.WriteFile(path, []byte(`{"id":"1","title":"ok"}`+"\n"+`{"id":"2","tit`), 0644)
+
+	ds, err := NewDocStore(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ds.Save(extractor.Document{ID: "1"}) // complete line: still deduped
+	ds.Save(extractor.Document{ID: "3", Title: "new"})
+	ds.Close()
+
+	data, _ := os.ReadFile(path)
+	lines := strings.Split(strings.TrimSpace(string(data)), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3: %q", len(lines), data)
+	}
+	var last extractor.Document
+	if err := json.Unmarshal([]byte(lines[2]), &last); err != nil || last.ID != "3" {
+		t.Errorf("last line %q should be the new document", lines[2])
+	}
+	if ds.Count() != 1 || ds.Skipped() != 1 {
+		t.Errorf("count=%d skipped=%d, want 1 and 1", ds.Count(), ds.Skipped())
+	}
+}
+
+// Very long lines (a big page's text) are read back without a size limit.
+func TestDocStore_LoadsLongLines(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "test.jsonl")
+	ds, _ := NewDocStore(path)
+	ds.Save(extractor.Document{ID: "big", Content: strings.Repeat("x", 3<<20)})
+	ds.Close()
+
+	ds2, _ := NewDocStore(path)
+	ds2.Save(extractor.Document{ID: "big"})
+	ds2.Close()
+	if ds2.Skipped() != 1 {
+		t.Error("a 3 MB line should still be read and deduped")
+	}
+}

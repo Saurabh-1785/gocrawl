@@ -3,6 +3,8 @@ package extractor
 import (
 	"strings"
 	"testing"
+
+	"golang.org/x/net/html"
 )
 
 func TestExtract_BasicHTML(t *testing.T) {
@@ -320,5 +322,53 @@ func TestNormalizeForDedup(t *testing.T) {
 		if got != tt.expected {
 			t.Errorf("normalizeForDedup(%q) = %q, want %q", tt.input, got, tt.expected)
 		}
+	}
+}
+
+// Block elements and <br> separate words; they used to be glued together.
+func TestExtract_BlockBoundariesAddSpaces(t *testing.T) {
+	doc := Extract("https://example.com/", `<table><tr><td>foo<br>bar</td></tr></table><ul><li><p>one</p><p>two</p></li></ul>`, 200)
+	for _, want := range []string{"foo bar", "one two"} {
+		if !strings.Contains(doc.Content, want) {
+			t.Errorf("content %q should contain %q", doc.Content, want)
+		}
+	}
+	// Inline tags don't add spaces, the same as a browser.
+	doc = Extract("https://example.com/", `<p>un<b>believ</b>able</p>`, 200)
+	if doc.Content != "unbelievable" {
+		t.Errorf("content = %q, want %q", doc.Content, "unbelievable")
+	}
+}
+
+// Some sites wrap the whole page in a <form>; its text must not be lost.
+func TestExtract_KeepsTextInsideForm(t *testing.T) {
+	doc := Extract("https://example.com/", `<form><p>Whole page lives here</p><select><option>Choice</option></select></form>`, 200)
+	if !strings.Contains(doc.Content, "Whole page lives here") {
+		t.Errorf("content = %q, want the form's text", doc.Content)
+	}
+	if strings.Contains(doc.Content, "Choice") {
+		t.Errorf("dropdown options should be skipped, got %q", doc.Content)
+	}
+}
+
+// Text placed straight inside a <div> is kept; loose link text is not.
+func TestExtract_LooseDivText(t *testing.T) {
+	doc := Extract("https://example.com/", `<div>Plain text in a div<a href="/x">menu link</a></div>`, 200)
+	if !strings.Contains(doc.Content, "Plain text in a div") {
+		t.Errorf("content = %q, want the div's text", doc.Content)
+	}
+	if strings.Contains(doc.Content, "menu link") {
+		t.Errorf("loose link text should not be content, got %q", doc.Content)
+	}
+}
+
+// ExtractNode on a parsed tree gives the same result as Extract on raw HTML.
+func TestExtractNodeMatchesExtract(t *testing.T) {
+	body := `<html><head><title>T</title></head><body><p>Hello</p></body></html>`
+	root, _ := html.Parse(strings.NewReader(body))
+	a := Extract("https://example.com/x", body, 200)
+	b := ExtractNode("https://example.com/x", root, 200)
+	if a.ID != b.ID || a.Title != b.Title || a.Content != b.Content {
+		t.Errorf("Extract = %+v, ExtractNode = %+v", a, b)
 	}
 }

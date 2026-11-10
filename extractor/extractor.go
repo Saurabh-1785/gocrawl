@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Saurabh-1785/gocrawl/urlutil"
 	"golang.org/x/net/html"
 )
 
@@ -22,10 +23,19 @@ type Document struct {
 	Timestamp     int64  `json:"timestamp"`      // Unix timestamp when the page was crawled
 }
 
-// Extract takes a page URL, its raw HTML body, and HTTP metadata,
-// and returns a Document with clean extracted content.
+// Extract parses raw HTML and returns a Document with clean content.
 func Extract(pageURL string, body string, statusCode int) Document {
-	// Normalize the URL first — this deduplicates /index.html vs /
+	root, err := html.Parse(strings.NewReader(body))
+	if err != nil {
+		root = nil // can't parse: return what we know (URL, domain, ...)
+	}
+	return ExtractNode(pageURL, root, statusCode)
+}
+
+// ExtractNode builds a Document from an already-parsed page.
+// The crawler uses this so each page is parsed only once.
+func ExtractNode(pageURL string, root *html.Node, statusCode int) Document {
+	// Normalize first, so "/" and "/index.html" give the same ID.
 	normalizedURL := normalizeForDedup(pageURL)
 
 	doc := Document{
@@ -35,74 +45,31 @@ func Extract(pageURL string, body string, statusCode int) Document {
 		StatusCode: statusCode,
 		Timestamp:  time.Now().Unix(),
 	}
-
-	// Parse the HTML
-	root, err := html.Parse(strings.NewReader(body))
-	if err != nil {
-		// If we can't parse, return what we have (URL, domain, etc.)
+	if root == nil {
 		return doc
 	}
 
 	doc.Title = extractTitle(root)
 	doc.Content = extractContent(root)
 
-	// ContentLength = length of the clean extracted text, not raw HTML.
-	// This tells the search engine how much searchable text there actually is.
+	// ContentLength = length of the clean text, not raw HTML.
+	// It tells a search engine how much searchable text there really is.
 	doc.ContentLength = len(doc.Content)
-
 	return doc
 }
 
-// normalizeForDedup normalizes a URL for deduplication purposes.
-// It strips index files (index.html, index.htm, index.php, default.html)
-// so that "/" and "/index.html" produce the same ID.
+// normalizeForDedup uses the same URL rules as the crawler (urlutil), so a
+// page's document ID always matches the key the crawler deduped it with.
 func normalizeForDedup(rawURL string) string {
-	parsed, err := url.Parse(rawURL)
+	normalized, err := urlutil.NormalizeURL(rawURL)
 	if err != nil {
 		return rawURL
 	}
-
-	// Lowercase scheme and host
-	parsed.Scheme = strings.ToLower(parsed.Scheme)
-	parsed.Host = strings.ToLower(parsed.Host)
-
-	// Remove fragment
-	parsed.Fragment = ""
-
-	// Strip common index files — these all represent the same page as "/"
-	indexFiles := []string{
-		"/index.html", "/index.htm", "/index.php",
-		"/default.html", "/default.htm",
-	}
-	pathLower := strings.ToLower(parsed.Path)
-	for _, idx := range indexFiles {
-		if pathLower == idx {
-			parsed.Path = "/"
-			break
-		}
-		// Also handle /subdir/index.html → /subdir/
-		if strings.HasSuffix(pathLower, idx) {
-			parsed.Path = parsed.Path[:len(parsed.Path)-len(idx)+1]
-			break
-		}
-	}
-
-	// Normalize empty path to "/"
-	if parsed.Path == "" {
-		parsed.Path = "/"
-	}
-
-	// Remove trailing slash for non-root paths
-	result := parsed.String()
-	if strings.HasSuffix(result, "/") && parsed.Path != "/" {
-		result = strings.TrimSuffix(result, "/")
-	}
-
-	return result
+	return normalized
 }
 
 // generateID creates a deterministic ID from the URL using SHA-256.
-// The same URL always produces the same ID.
+// The same URL always produces the same ID, on any machine, in any run.
 func generateID(pageURL string) string {
 	hash := sha256.Sum256([]byte(pageURL))
 	return fmt.Sprintf("%x", hash)
@@ -118,19 +85,14 @@ func extractDomain(pageURL string) string {
 	return parsed.Hostname()
 }
 
-// extractTitle finds the page title.
-// Priority: <title> tag first, then falls back to the first <h1>.
+// extractTitle finds the page title: <title> first, then the first <h1>.
 func extractTitle(root *html.Node) string {
-	// Try <title> first
-	if title := findFirstTag(root, "title"); title != "" {
-		return strings.TrimSpace(title)
+	if title := strings.TrimSpace(findFirstTag(root, "title")); title != "" {
+		return collapseWhitespace(title)
 	}
-
-	// Fallback to first <h1>
-	if h1 := findFirstTag(root, "h1"); h1 != "" {
-		return strings.TrimSpace(h1)
+	if h1 := strings.TrimSpace(findFirstTag(root, "h1")); h1 != "" {
+		return collapseWhitespace(h1)
 	}
-
 	return ""
 }
 
@@ -139,29 +101,23 @@ func findFirstTag(node *html.Node, tag string) string {
 	if node.Type == html.ElementNode && node.Data == tag {
 		return getTextContent(node)
 	}
-
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		if result := findFirstTag(child, tag); result != "" {
 			return result
 		}
 	}
-
 	return ""
 }
 
-// extractContent extracts clean text from content-bearing HTML elements.
-// It collects text from <p>, <h1>-<h6>, <li>, and <td> tags,
-// skipping <script>, <style>, <nav>, <header>, <footer> elements.
+// extractContent extracts clean text from the page.
 func extractContent(root *html.Node) string {
 	var parts []string
 	collectContent(root, &parts)
-
-	// Join all text parts with spaces, collapse whitespace
-	raw := strings.Join(parts, " ")
-	return collapseWhitespace(raw)
+	return collapseWhitespace(strings.Join(parts, " "))
 }
 
-// contentTags are HTML elements that typically contain readable page content.
+// contentTags are elements that usually hold readable text.
+// All text inside them is taken.
 var contentTags = map[string]bool{
 	"p": true, "h1": true, "h2": true, "h3": true,
 	"h4": true, "h5": true, "h6": true,
@@ -171,61 +127,91 @@ var contentTags = map[string]bool{
 	"dt": true, "dd": true,
 }
 
-// skipTags are HTML elements we should skip entirely (no useful content).
+// skipTags are elements with no useful text. Their whole subtree is skipped,
+// even when nested inside a content tag (Wikipedia puts <style> inside <p>).
+//
+// <form> is NOT skipped: some sites (e.g. ASP.NET) wrap the whole page in one.
 var skipTags = map[string]bool{
-	"script": true, "style": true, "noscript": true,
+	"script": true, "style": true, "noscript": true, "template": true,
 	"nav": true, "header": true, "footer": true,
-	"aside": true, "form": true, "iframe": true,
+	"aside": true, "iframe": true,
 	"svg": true, "math": true,
+	"select": true, "option": true, "button": true,
 }
 
-// collectContent recursively walks the DOM tree, collecting text from content tags.
+// looseTextParents are containers whose DIRECT text is kept even though they
+// are not content tags, e.g. <div>Some text</div>. Inline tags like <a> are
+// not listed, so loose menu links don't leak in.
+var looseTextParents = map[string]bool{
+	"div": true, "section": true, "article": true, "main": true,
+	"body": true, "span": true, "font": true, "center": true,
+}
+
+// blockTags break words apart: "<td>foo<br>bar</td>" must give "foo bar",
+// not "foobar". Inline tags (<a>, <b>, <span>) don't add a space, the same
+// way a browser renders them.
+var blockTags = map[string]bool{
+	"br": true, "p": true, "div": true, "li": true, "ul": true, "ol": true,
+	"td": true, "th": true, "tr": true, "table": true,
+	"h1": true, "h2": true, "h3": true, "h4": true, "h5": true, "h6": true,
+	"section": true, "article": true, "blockquote": true, "pre": true,
+	"dt": true, "dd": true, "dl": true, "hr": true, "figcaption": true,
+}
+
+// collectContent walks the DOM tree depth-first, collecting text.
 func collectContent(node *html.Node, parts *[]string) {
-	// Skip non-content elements entirely
-	if node.Type == html.ElementNode && skipTags[node.Data] {
+	switch {
+	case node.Type == html.ElementNode && skipTags[node.Data]:
+		return
+
+	case node.Type == html.ElementNode && contentTags[node.Data]:
+		if text := strings.TrimSpace(getTextContent(node)); text != "" {
+			*parts = append(*parts, text)
+		}
+		return // already took all text inside
+
+	case node.Type == html.TextNode:
+		if node.Parent != nil && node.Parent.Type == html.ElementNode && looseTextParents[node.Parent.Data] {
+			if text := strings.TrimSpace(node.Data); text != "" {
+				*parts = append(*parts, text)
+			}
+		}
 		return
 	}
 
-	// If this is a content-bearing element, grab its text
-	if node.Type == html.ElementNode && contentTags[node.Data] {
-		text := strings.TrimSpace(getTextContent(node))
-		if text != "" {
-			*parts = append(*parts, text)
-		}
-		return // Don't recurse into children (we already got the text)
-	}
-
-	// Otherwise, recurse into children
 	for child := node.FirstChild; child != nil; child = child.NextSibling {
 		collectContent(child, parts)
 	}
 }
 
-// getTextContent returns all text content within an HTML node, recursively.
-// It strips all HTML tags and returns just the text.
-// It also skips <script>, <style>, and other non-content elements that may be
-// nested inside content tags (e.g., Wikipedia puts <style> inside <p> for citations).
+// getTextContent returns all text inside a node, without tags.
 func getTextContent(node *html.Node) string {
-	if node.Type == html.TextNode {
-		return node.Data
-	}
-
-	// Skip script/style/etc. even when nested inside content elements.
-	// This prevents CSS rules and JS from leaking into extracted text.
-	if node.Type == html.ElementNode && skipTags[node.Data] {
-		return ""
-	}
-
 	var sb strings.Builder
-	for child := node.FirstChild; child != nil; child = child.NextSibling {
-		sb.WriteString(getTextContent(child))
-	}
+	writeText(node, &sb)
 	return sb.String()
 }
 
-// collapseWhitespace replaces all runs of whitespace (spaces, tabs, newlines)
-// with a single space, and trims leading/trailing whitespace.
+func writeText(node *html.Node, sb *strings.Builder) {
+	if node.Type == html.TextNode {
+		sb.WriteString(node.Data)
+		return
+	}
+	if node.Type == html.ElementNode && skipTags[node.Data] {
+		return
+	}
+	block := node.Type == html.ElementNode && blockTags[node.Data]
+	if block {
+		sb.WriteByte(' ')
+	}
+	for child := node.FirstChild; child != nil; child = child.NextSibling {
+		writeText(child, sb)
+	}
+	if block {
+		sb.WriteByte(' ')
+	}
+}
+
+// collapseWhitespace replaces every run of whitespace with one space and trims.
 func collapseWhitespace(s string) string {
-	fields := strings.Fields(s)
-	return strings.Join(fields, " ")
+	return strings.Join(strings.Fields(s), " ")
 }

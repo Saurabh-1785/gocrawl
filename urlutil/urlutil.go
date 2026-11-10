@@ -1,113 +1,161 @@
 package urlutil
 
 import (
+	"net"
 	"net/url"
+	"sort"
 	"strings"
 )
 
-// NormalizeURL cleans up a URL so we can compare URLs consistently.
-// For example, "HTTP://Example.COM/page#section" becomes "http://example.com/page"
-// It also strips common index files (index.html, index.htm, index.php)
-// so that "/" and "/index.html" are treated as the same URL.
+// indexFiles are file names that mean the same page as their folder.
+var indexFiles = []string{
+	"/index.html", "/index.htm", "/index.php",
+	"/default.html", "/default.htm",
+}
+
+// trackingParams are query parameters that only track clicks.
+// They never change the page, so they are removed from the dedupe key.
+var trackingParams = map[string]bool{
+	"gclid": true, "fbclid": true, "msclkid": true,
+	"mc_cid": true, "mc_eid": true, "_ga": true,
+}
+
+// NormalizeURL turns a URL into one canonical form, used as the dedupe key.
+// Two URLs that point to the same page should normalize to the same string.
+//
+//	HTTP://Example.COM:80/blog/index.html?b=2&a=1&utm_source=x#top
+//	  → http://example.com/blog?a=1&b=2
+//
+// The result is a KEY, not necessarily the exact URL to fetch. The crawler
+// fetches the URL as the page author wrote it, so relative links keep working.
 func NormalizeURL(rawURL string) (string, error) {
-	// Step 1: Parse the URL into its components
-	parsedURL, err := url.Parse(rawURL)
+	u, err := url.Parse(strings.TrimSpace(rawURL))
 	if err != nil {
 		return "", err
 	}
 
-	// Step 2: Lowercase the scheme (http, https)
-	parsedURL.Scheme = strings.ToLower(parsedURL.Scheme)
+	// Scheme and host are case-insensitive; the path is not.
+	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = normalizeHost(u.Scheme, u.Host)
 
-	// Step 3: Lowercase the host (domain name)
-	parsedURL.Host = strings.ToLower(parsedURL.Host)
+	// The fragment (#section) is in-page navigation: same page either way.
+	u.Fragment = ""
+	u.RawFragment = ""
 
-	// Step 4: Remove the fragment (#section)
-	// Fragments are just for in-page navigation, same page either way
-	parsedURL.Fragment = ""
-
-	// Step 5: Normalize empty path to "/" so that
-	// "http://example.com" and "http://example.com/" are treated as the same URL
-	if parsedURL.Path == "" {
-		parsedURL.Path = "/"
+	// "http://example.com" and "http://example.com/" are the same page.
+	if u.Path == "" {
+		u.Path = "/"
 	}
 
-	// Step 6: Strip common index files — these all represent the same page
-	// as their parent directory. e.g., /index.html → /, /blog/index.html → /blog/
-	indexFiles := []string{
-		"/index.html", "/index.htm", "/index.php",
-		"/default.html", "/default.htm",
-	}
-	pathLower := strings.ToLower(parsedURL.Path)
+	// "/blog/index.html" is the same page as "/blog/".
+	pathLower := strings.ToLower(u.Path)
 	for _, idx := range indexFiles {
-		if pathLower == idx {
-			parsedURL.Path = "/"
-			break
-		}
 		if strings.HasSuffix(pathLower, idx) {
-			parsedURL.Path = parsedURL.Path[:len(parsedURL.Path)-len(idx)+1]
+			u.Path = u.Path[:len(u.Path)-len(idx)+1]
+			u.RawPath = ""
 			break
 		}
 	}
 
-	// Step 7: Build the cleaned URL string
-	result := parsedURL.String()
-
-	// Step 8: Remove trailing slash, but keep it for root paths like "http://example.com/"
-	if strings.HasSuffix(result, "/") && parsedURL.Path != "/" && parsedURL.Path != "" {
-		result = strings.TrimSuffix(result, "/")
+	// "/blog/" and "/blog" are treated as the same page (root "/" stays).
+	if u.Path != "/" && strings.HasSuffix(u.Path, "/") {
+		u.Path = strings.TrimRight(u.Path, "/")
+		if u.Path == "" {
+			u.Path = "/"
+		}
+		u.RawPath = ""
 	}
 
-	return result, nil
+	u.RawQuery = normalizeQuery(u.RawQuery)
+	u.ForceQuery = false // "/a?" → "/a"
+
+	return u.String(), nil
+}
+
+// normalizeHost lowercases the host and removes the default port
+// (":80" for http, ":443" for https).
+func normalizeHost(scheme, host string) string {
+	host = strings.ToLower(host)
+	h, port, err := net.SplitHostPort(host)
+	if err != nil {
+		return host // no port
+	}
+	if (scheme == "http" && port == "80") || (scheme == "https" && port == "443") {
+		if strings.Contains(h, ":") {
+			return "[" + h + "]" // IPv6 literal needs brackets
+		}
+		return h
+	}
+	return host
+}
+
+// normalizeQuery sorts parameters and removes tracking ones,
+// so "?b=2&a=1&utm_source=x" and "?a=1&b=2" give the same key.
+func normalizeQuery(rawQuery string) string {
+	if rawQuery == "" {
+		return ""
+	}
+	values, err := url.ParseQuery(rawQuery)
+	if err != nil {
+		return rawQuery // keep odd queries as they are
+	}
+	for key := range values {
+		lower := strings.ToLower(key)
+		if strings.HasPrefix(lower, "utm_") || trackingParams[lower] {
+			delete(values, key)
+		}
+	}
+	for _, v := range values {
+		sort.Strings(v)
+	}
+	return values.Encode() // Encode sorts by key
 }
 
 // ResolveURL converts a relative URL to an absolute URL using a base URL.
-// For example: base="http://example.com/blog", relative="../about"
-// Result: "http://example.com/about"
+// For example: base="http://example.com/blog/post", relative="../about"
+// gives "http://example.com/about".
 func ResolveURL(base string, relative string) (string, error) {
-	// Parse the base URL
 	baseURL, err := url.Parse(base)
 	if err != nil {
 		return "", err
 	}
-
-	// Parse the relative URL
 	relativeURL, err := url.Parse(relative)
 	if err != nil {
 		return "", err
 	}
-
-	// Resolve: combine base + relative to get an absolute URL
-	resolvedURL := baseURL.ResolveReference(relativeURL)
-
-	return resolvedURL.String(), nil
+	return baseURL.ResolveReference(relativeURL).String(), nil
 }
 
-// IsSameDomain checks if a given URL belongs to the same domain as the seed URL.
-// This is used to keep the crawler within one website.
+// SiteHost returns the part of a host that decides "same website":
+// lowercase, default port removed, and a leading "www." removed.
+// So "WWW.Example.com:443" (https) and "example.com" are the same site.
+// Other subdomains stay different: "blog.example.com" is its own site.
+func SiteHost(scheme, host string) string {
+	return strings.TrimPrefix(normalizeHost(strings.ToLower(scheme), host), "www.")
+}
+
+// IsSameDomain reports whether checkURL is on the same website as seedURL.
+// http and https count as the same site, and so do "www.example.com"
+// and "example.com".
 func IsSameDomain(seedURL string, checkURL string) bool {
-	seedParsed, err := url.Parse(seedURL)
+	seed, err := url.Parse(seedURL)
 	if err != nil {
 		return false
 	}
-
-	checkParsed, err := url.Parse(checkURL)
+	check, err := url.Parse(checkURL)
 	if err != nil {
 		return false
 	}
-
-	// Compare the hostnames (case-insensitive)
-	return strings.EqualFold(seedParsed.Host, checkParsed.Host)
+	return SiteHost(seed.Scheme, seed.Host) == SiteHost(check.Scheme, check.Host)
 }
 
-// IsValidURL checks if a URL uses the http or https scheme.
-// We don't want to crawl mailto:, javascript:, ftp:, etc.
+// IsValidURL reports whether a URL is http or https and has a host.
+// mailto:, javascript:, ftp: and "http://" (no host) are rejected.
 func IsValidURL(rawURL string) bool {
-	parsedURL, err := url.Parse(rawURL)
+	u, err := url.Parse(rawURL)
 	if err != nil {
 		return false
 	}
-
-	scheme := strings.ToLower(parsedURL.Scheme)
-	return scheme == "http" || scheme == "https"
+	scheme := strings.ToLower(u.Scheme)
+	return (scheme == "http" || scheme == "https") && u.Host != ""
 }
